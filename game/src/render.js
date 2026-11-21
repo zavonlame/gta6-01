@@ -1,7 +1,13 @@
 // Drawing only: the world's state and the current screen in, pixels out. A camera follows
 // the player through the 3840x2560 city and shows a 1280x720 window of it, scaled to fit the
 // browser window. Flat shapes and canvas text for the city, the HUD and the panels.
-import { CAR, FONT, PALETTE, PED, PLAYER, VIEW, WORLD } from './config.js';
+//
+// The HUD is the game's face: cash, wanted stars, health, a mission tracker with the job
+// and its stage, the objective line, speed, a police-dispatch panel naming the units on
+// the chase with their distance and tactic, a weapon strip, the off-screen objective
+// arrow, and the minimap. Every panel reads only state the world already keeps —
+// the HUD adds no rules, it shows the ones that are running.
+import { CAR, DISPATCH_CALLSIGNS, FONT, MISSIONS, MISSION_STAGES, PALETTE, PED, PLAYER, VIEW, WEAPON, WORLD } from './config.js';
 
 export const SCREEN_TITLE = 'title';
 export const SCREEN_PLAY = 'play';
@@ -12,6 +18,9 @@ export const SCREEN_COMPLETE = 'complete';
 
 const PANEL = { width: 680, top: 150, line: 32, bottom: 76 };
 const MINI = { width: 230, height: 154, margin: 16 };
+const DISPATCH = { x: 16, y: 56, width: 308, header: 26, row: 20, pad: 10, maxRows: 4 };
+const TRACKER = { width: 560, height: 52, top: 56 };
+const WEAPON_STRIP = { width: 230, height: 48, gap: 8 };
 
 // A stable hash from a building's position, so its windows never flicker.
 function hash(x, y) {
@@ -254,6 +263,80 @@ export function createRenderer(canvas) {
     context.fill();
   }
 
+  /** Police dispatch: every active unit on the chase, named, with its distance in
+   * metres and what it is doing — read straight from the cops the world keeps. */
+  function drawDispatch(state) {
+    const p = state.player;
+    const units = [];
+    for (let i = 0; i < state.cops.length; i += 1) {
+      const cop = state.cops[i];
+      if (!cop.active) continue;
+      const d = Math.hypot(cop.x - p.x, cop.y - p.y);
+      const metres = Math.max(1, Math.round(d * 0.06));
+      let tactic = 'PURSUIT';
+      if (cop.down) tactic = 'DOWN';
+      else if (cop.inCar) tactic = d < 150 ? 'RAMMING' : 'PURSUIT';
+      else tactic = cop.arrest > 0 ? 'HOLDING' : 'ON FOOT';
+      units.push({ name: DISPATCH_CALLSIGNS[i], metres, tactic });
+      if (units.length >= DISPATCH.maxRows) break;
+    }
+    if (units.length === 0) return;
+    const height = DISPATCH.header + units.length * DISPATCH.row + DISPATCH.pad;
+    context.fillStyle = 'rgba(13, 15, 20, 0.78)';
+    context.fillRect(DISPATCH.x, DISPATCH.y, DISPATCH.width, height);
+    context.fillStyle = '#4b7dff';
+    context.fillRect(DISPATCH.x, DISPATCH.y, 4, height);
+    text('SOLMAR PD — DISPATCH', DISPATCH.x + 14, DISPATCH.y + 6, 14, '#8fb0ff', 'left');
+    for (let i = 0; i < units.length; i += 1) {
+      const u = units[i];
+      const y = DISPATCH.y + DISPATCH.header + i * DISPATCH.row;
+      text(u.name, DISPATCH.x + 14, y, 15, PALETTE.text, 'left');
+      text(`${u.metres} m`, DISPATCH.x + 158, y, 15, PALETTE.muted, 'left');
+      text(u.tactic, DISPATCH.x + DISPATCH.width - 12, y, 15, u.tactic === 'RAMMING' ? '#ff6b6b' : PALETTE.star, 'right');
+    }
+  }
+
+  /** Mission tracker: which job of the story, its name, and the stage the player
+   * is on — the stage line comes from the world's mission index and stage. */
+  function drawMissionTracker(state) {
+    const index = state.missionIndex;
+    const mission = MISSIONS[index];
+    let stage = (MISSION_STAGES[index] && MISSION_STAGES[index][state.missionStage]) || '';
+    if (index === 3 && state.missionStage === 0) {
+      let left = 0;
+      for (const pk of state.pickups) if (pk.active && pk.kind === 'drop') left += 1;
+      const t = Math.max(0, Math.ceil(state.missionTimer));
+      stage = `Grab the drops: ${left} left · ${Math.floor(t / 60)}:${String(t % 60).padStart(2, '0')} on the clock`;
+    }
+    const cx = VIEW.width / 2;
+    const y = TRACKER.top;
+    context.fillStyle = 'rgba(13, 15, 20, 0.72)';
+    context.fillRect(cx - TRACKER.width / 2, y, TRACKER.width, TRACKER.height);
+    text(`JOB ${index + 1}/${MISSIONS.length} · ${mission.name}`, cx, y + 8, 16, PALETTE.star, 'center');
+    if (stage) text(stage, cx, y + 30, 15, PALETTE.text, 'center');
+  }
+
+  /** Weapon strip: the player's fists and whether the next punch is ready,
+   * from the punch cooldown the world already tracks. */
+  function drawWeaponStrip(state) {
+    const p = state.player;
+    const w = WEAPON_STRIP.width;
+    const x = VIEW.width - w - MINI.margin;
+    const y = VIEW.height - MINI.height - MINI.margin - WEAPON_STRIP.gap - WEAPON_STRIP.height;
+    const ready = p.punchCooldown <= 0;
+    const frac = Math.max(0, Math.min(1, 1 - p.punchCooldown / PLAYER.punchCooldown));
+    context.fillStyle = 'rgba(13, 15, 20, 0.78)';
+    context.fillRect(x, y, w, WEAPON_STRIP.height);
+    text(`WEAPON · ${WEAPON.key}`, x + 12, y + 6, 12, PALETTE.muted, 'left');
+    text(WEAPON.name, x + 12, y + 20, 17, PALETTE.text, 'left');
+    text(ready ? 'READY' : 'COOLING', x + w - 12, y + 6, 12, ready ? PALETTE.health : PALETTE.muted, 'right');
+    const bw = w - 24;
+    context.fillStyle = '#11141b';
+    context.fillRect(x + 12, y + WEAPON_STRIP.height - 8, bw, 6);
+    context.fillStyle = ready ? PALETTE.health : PALETTE.star;
+    context.fillRect(x + 12, y + WEAPON_STRIP.height - 8, bw * frac, 6);
+  }
+
   function drawHud(state) {
     const p = state.player;
     context.textBaseline = 'top';
@@ -303,6 +386,9 @@ export function createRenderer(canvas) {
         context.restore();
       }
     }
+    drawDispatch(state);
+    drawMissionTracker(state);
+    drawWeaponStrip(state);
     drawMinimap(state);
   }
 

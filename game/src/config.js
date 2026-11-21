@@ -88,6 +88,31 @@ export const MISSIONS = [
   },
 ];
 
+/**
+ * One stage line per mission stage, shown in the mission tracker under the wanted
+ * stars. Mission 3's first stage is built live (drops left and time on the clock),
+ * so its slot here is a fallback only.
+ */
+export const MISSION_STAGES = [
+  ['Steal any parked car — walk up to one and press E.'],
+  ['Pick up the package at the pier, south end of the beach road.', 'Deliver the package to Milo\u2019s garage in Old Town.'],
+  ['Lose the heat — reach the safehouse in Marina.'],
+  ['Grab the drops across the city, then bring the cash to Milo.', 'Bring the cash to Milo\u2019s garage in Old Town.'],
+];
+
+/**
+ * Solmar PD unit callsigns, one per cop slot in the order the world spawns them,
+ * so the dispatch panel names the same unit every time a slot is on the chase.
+ */
+export const DISPATCH_CALLSIGNS = [
+  'TARPON 12', 'GULL 07', 'MARLIN 23', 'REEF 41',
+  'HERON 55', 'PELICAN 68', 'OSPREY 71', 'MANATEE 84',
+  'DOLPHIN 90', 'SHARK 03', 'STINGRAY 17', 'BARRACUDA 29',
+];
+
+/** The player's only weapon: fists, thrown with Space or F, on a short cooldown. */
+export const WEAPON = { name: 'FISTS', key: 'SPACE / F' };
+
 export const PALETTE = {
   backdrop: '#0d0f14',
   grass: '#3f6b3a',

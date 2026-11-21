@@ -2,6 +2,10 @@
 // and then plays the real rules forward for a fixed number of steps, steered by a simple
 // autopilot (drive toward the mission marker, steer around buildings), so the frame is what
 // a short game really looks like and the same seed always gives the same frame.
+//
+// The shot order lives in shots.json, not here: the chase is the cover (image 1), the
+// drive and the busted screen follow, and the start screen goes last — a menu alone
+// never leads the set.
 import { STEP } from './config.js';
 import { EVENT_BUSTED, EVENT_WASTED } from './world.js';
 import { SCREEN_BUSTED, SCREEN_PLAY, SCREEN_TITLE } from './render.js';
@@ -48,6 +52,18 @@ export function stageShot(name, world) {
   const target = world.state.missionTarget;
   for (let i = 0; i < seconds / STEP; i += 1) {
     world.step(STEP, { move: driveToward(world, target.x, target.y), enter: false, punch: false }, false);
+  }
+  if (name === 'chase') {
+    // Hold the frame until a cop car is inside the camera window, so the cover
+    // shows the chase and not an empty road — at most a few extra seconds.
+    const p = world.state.player;
+    let inFrame = false;
+    for (let extra = 0; extra < 6 / STEP && !inFrame; extra += 1) {
+      world.step(STEP, { move: driveToward(world, target.x, target.y), enter: false, punch: false }, false);
+      for (const cop of world.state.cops) {
+        if (cop.active && cop.inCar && Math.abs(cop.x - p.x) < 640 && Math.abs(cop.y - p.y) < 360) inFrame = true;
+      }
+    }
   }
   return { screen: SCREEN_PLAY, best: world.state.player.cash };
 }
