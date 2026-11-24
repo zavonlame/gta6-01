@@ -1,9 +1,14 @@
-// SOLMAR HEAT — every tuning number and colour in one place.
-// The city is a fixed 3840x2560 world; the camera shows a 1280x720 window of it,
-// scaled to the browser window, so no rule below depends on the screen size.
+// SOLMAR HEAT — every number the game tunes by, in one place.
+//
+// The city is a fixed 3840 x 2560 map; the camera shows a 1280 x 720 slice
+// of it, scaled to whatever window the player has. None of these values
+// depends on screen size, and none of them is read from anywhere else.
+
 export const VIEW = { width: 1280, height: 720 };
 
-/** The simulation's fixed step, in seconds: 60 updates a second whatever the display's rate. */
+// The simulation advances in fixed 1/60 s ticks. The display loop runs as
+// many ticks as a frame owes, so the world moves at the same speed on a
+// 60 Hz screen and a 144 Hz one.
 export const STEP = 1 / 60;
 
 export const WORLD = {
@@ -12,7 +17,7 @@ export const WORLD = {
   roadGap: 320, // distance between street centrelines
   roadWidth: 72,
   sidewalk: 14,
-  beachY: 2300, // sand and sea below this line
+  beachY: 2300, // sand begins here; the sea further south
   seaY: 2440,
 };
 
@@ -34,7 +39,8 @@ export const CAR = {
   reverseAccel: 260,
   maxSpeed: 520,
   maxReverse: 160,
-  turnRate: 2.6, // radians per second at full steer, scaled by speed
+  // radians per second at full lock, scaled down at low speed
+  turnRate: 2.6,
   grip: 3.2,
   trafficSpeed: 150,
   trafficCount: 14,
@@ -45,72 +51,148 @@ export const PED = { radius: 9, speed: 55, fleeSpeed: 120, count: 26 };
 export const COP = {
   radius: 13,
   footSpeed: 205,
-  carSpeed: 500, // a touch slower than the player's car: a good driver can pull away
-  arrestTime: 1.6, // seconds a cop must hold the player on foot to bust them
-  ramDamage: 4, // health lost per second while a cop car rams the player's car
+  // a clean driver can pull away: the patrol car tops out just below the player
+  carSpeed: 500,
+  // seconds a foot cop must hold the player before the bust lands
+  arrestTime: 1.6,
+  // health lost per second while a cop car rams the player's car
+  ramDamage: 4,
   punchDamage: 12,
 };
 
 export const WANTED = {
   max: 5,
-  decayDelay: 6, // seconds after the last crime before stars start to fall
-  decayStep: 4, // seconds per star lost while unseen
+  // quiet seconds after the last crime before stars start to fall
+  decayDelay: 6,
+  // seconds per star lost while the player stays out of trouble
+  decayStep: 4,
   bustRadius: 34,
 };
 
-/** Cash drops and mission rewards, in dollars. */
-export const CASH = { stealCar: 0, mission1: 250, mission2: 500, mission3: 800, mission4: 1500, drop: 150 };
+// Payouts, in dollars. Stealing a car pays nothing — the car is the reward.
+export const CASH = {
+  stealCar: 0,
+  mission1: 250,
+  mission2: 500,
+  mission3: 800,
+  mission4: 1500,
+  mission5: 900,
+  mission6: 1200,
+  mission7: 1500,
+  mission8: 2500,
+  drop: 150,
+};
 
+// Milo's eight jobs, in story order. Each has the brief the HUD shows, the
+// line it shows when the job pays out, and the line Milo says when it starts.
 export const MISSIONS = [
   {
     id: 0,
     name: 'WHEELS',
     brief: 'Milo needs wheels. Steal any parked car. Walk up to one and press E.',
     done: 'Car acquired. Milo is impressed.',
+    dialogue: 'Solmar runs on wheels, kid. Go steal us a ride.',
   },
   {
     id: 1,
     name: 'THE PIER DROP',
     brief: 'A package waits at the pier, south end of the beach road. Pick it up, then take it to the garage in Old Town.',
     done: 'Package delivered. $500 in your pocket.',
+    dialogue: 'Package at the pier. Grab it, bring it to my garage. No detours.',
   },
   {
     id: 2,
     name: 'HEAT',
     brief: 'The pickup was a setup — the Solmar PD is on you. Lose the heat and reach the safehouse in Marina.',
     done: 'You shook them. Milo owes you one.',
+    dialogue: 'It was a setup! Lose the heat, then get to the Marina safehouse.',
   },
   {
     id: 3,
     name: 'PAYDAY RUN',
     brief: 'Three cash drops are waiting across the city. Grab them all in two minutes and bring them to Milo.',
     done: 'Payday! The crew eats tonight.',
+    dialogue: 'Three drops, two minutes. The crew eats tonight — move!',
+  },
+  {
+    id: 4,
+    name: 'CREW CALL',
+    brief: 'A crew makes the job. Find DANA the driver, RICO the muscle and LENA the hacker — all three, across the city.',
+    done: 'The crew is yours. DANA, RICO and LENA ride with you now.',
+    dialogue: 'A crew makes the job. Find DANA, RICO and LENA — all three.',
+  },
+  {
+    id: 5,
+    name: 'THE VAULT',
+    brief: 'Vault cash, ninety seconds, PD everywhere. Get it to Milo\u2019s garage before the clock dies.',
+    done: 'Vault cash delivered. $1,200 — clean.',
+    dialogue: 'Vault cash, ninety seconds, PD everywhere. Drive like you mean it.',
+  },
+  {
+    id: 6,
+    name: 'AIR SUPPORT',
+    brief: 'Four stars and CONDOR-1 overhead. Vanish from the PD, then reach the Marina safehouse.',
+    done: 'You vanished under the chopper. Even the air unit lost you.',
+    dialogue: 'Four stars and a chopper overhead. Vanish, then safehouse.',
+  },
+  {
+    id: 7,
+    name: 'THE BIG SCORE',
+    brief: 'Four cash drops across the whole city, three minutes, then bring it all to Milo. This is the one we retire on.',
+    done: 'THE BIG SCORE — $2,500. Solmar is yours.',
+    dialogue: 'Four drops, one payday. This is the one we retire on.',
   },
 ];
 
-/**
- * One stage line per mission stage, shown in the mission tracker under the wanted
- * stars. Mission 3's first stage is built live (drops left and time on the clock),
- * so its slot here is a fallback only.
- */
+// The crew, recruited in job 5 (CREW CALL). Every perk changes how the game
+// actually plays — they are not flavour text.
+export const CREW = [
+  { name: 'DANA', role: 'DRIVER', perk: 'TOP SPEED +8%' },
+  { name: 'RICO', role: 'MUSCLE', perk: 'PUNCH +16 DMG' },
+  { name: 'LENA', role: 'HACKER', perk: 'HEAT FADES FAST' },
+];
+
+// Where each crew member waits to be recruited: street corners, always reachable.
+export const CREW_SPOTS = [
+  { x: 800, y: 480 },
+  { x: 3360, y: 800 },
+  { x: 1920, y: 1440 },
+];
+
+// The four drops of the final job, all on street intersections.
+export const DROPS7 = [
+  { x: 1120, y: 1760 },
+  { x: 2880, y: 1120 },
+  { x: 2080, y: 400 },
+  { x: 3360, y: 2080 },
+];
+
+// Respect titles, by jobs finished: index 0 is a fresh player, 8 is the kingpin.
+export const RESPECT_RANKS = ['STREET', 'STREET', 'HUSTLER', 'HUSTLER', 'MADE', 'MADE', 'HEAVYWEIGHT', 'HEAVYWEIGHT', 'KINGPIN'];
+
+// One tracker line per stage of each job, shown under the wanted stars.
+// Job 3's first stage is written live (drops left plus the clock), so its
+// entry here is only a fallback the tracker never has to use.
 export const MISSION_STAGES = [
   ['Steal any parked car — walk up to one and press E.'],
   ['Pick up the package at the pier, south end of the beach road.', 'Deliver the package to Milo\u2019s garage in Old Town.'],
   ['Lose the heat — reach the safehouse in Marina.'],
   ['Grab the drops across the city, then bring the cash to Milo.', 'Bring the cash to Milo\u2019s garage in Old Town.'],
+  ['Find your crew: DANA · RICO · LENA — 3 to recruit.'],
+  ['Deliver the vault cash to Milo\u2019s garage — 90 seconds, PD on your tail.'],
+  ['Lose the 4-star heat — then reach the safehouse in Marina.'],
+  ['Grab the drops across the city, then bring the cash to Milo.', 'Bring the cash to Milo\u2019s garage in Old Town.'],
 ];
 
-/**
- * Solmar PD unit callsigns, one per cop slot in the order the world spawns them,
- * so the dispatch panel names the same unit every time a slot is on the chase.
- */
+// Solmar PD callsigns, one per cop slot in spawn order, so the dispatch
+// panel always names the same unit when a given slot joins the chase.
 export const DISPATCH_CALLSIGNS = [
   'TARPON 12', 'GULL 07', 'MARLIN 23', 'REEF 41',
   'HERON 55', 'PELICAN 68', 'OSPREY 71', 'MANATEE 84',
   'DOLPHIN 90', 'SHARK 03', 'STINGRAY 17', 'BARRACUDA 29',
 ];
 
-/** The player's only weapon: fists, thrown with Space or F, on a short cooldown. */
+// The player's only weapon: fists, thrown with Space or F, on a short cooldown.
 export const WEAPON = { name: 'FISTS', key: 'SPACE / F' };
 
 export const PALETTE = {
@@ -146,6 +228,6 @@ export const PALETTE = {
 
 export const FONT = 'system-ui, -apple-system, "Segoe UI", sans-serif';
 
-/** Where progress is kept between visits (this browser only). */
+// Where progress lives between visits (this browser only).
 export const SAVE_KEY = 'solmar-heat.save.v1';
 export const BEST_KEY = 'solmar-heat.best.v1';

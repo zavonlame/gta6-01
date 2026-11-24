@@ -1,9 +1,11 @@
-// SOLMAR HEAT — the game's rules and state, with no drawing and no browser in it:
-// the city, the player on foot and by car, traffic, pedestrians, police, the wanted level,
-// combat, missions with a story, cash and save data. step() advances one fixed step and
-// returns what happened as bit flags, so the caller can react without the world knowing
-// about screens or sound. Nothing here allocates after createWorld returns.
-import { CAR, CASH, COP, MISSIONS, PED, PLAYER, WANTED, WORLD } from './config.js';
+// SOLMAR HEAT — the rules and the state, with no drawing and no browser
+// in it: the city, the player on foot and by car, traffic, pedestrians,
+// police, the wanted level, combat, missions with a story, cash and saves.
+//
+// step() advances one fixed tick and returns what happened as bit flags,
+// so the caller can react without the world knowing about screens or
+// sound. After createWorld returns, nothing here allocates.
+import { CAR, CASH, COP, CREW, CREW_SPOTS, DROPS7, MISSIONS, PED, PLAYER, WANTED, WORLD } from './config.js';
 
 export const EVENT_BUSTED = 1;
 export const EVENT_WASTED = 2;
@@ -12,15 +14,20 @@ export const EVENT_CASH = 8;
 export const EVENT_CRIME = 16;
 export const EVENT_PUNCH = 32;
 
+// Street centrelines, built once from the world size and road spacing.
 const STREETS_X = [];
 for (let x = 160; x < WORLD.width; x += WORLD.roadGap) STREETS_X.push(x);
 const STREETS_Y = [];
 for (let y = 160; y < WORLD.height; y += WORLD.roadGap) STREETS_Y.push(y);
 
-const GARAGE = { x: 800, y: 640 }; // Milo's garage, fronting the street in Old Town
-const PIER = { x: 1920, y: 2360 }; // the pier drop, beach road
-const SAFEHOUSE = { x: 3360, y: 480 }; // Marina safehouse
-const START = { x: 640, y: 720 }; // downtown, on foot
+// Named places: Milo's garage fronts the street in Old Town, the pier drop
+// sits on the beach road, the safehouse is in Marina, the player starts
+// downtown on foot.
+const GARAGE = { x: 800, y: 640 };
+const PIER = { x: 1920, y: 2360 };
+const SAFEHOUSE = { x: 3360, y: 480 };
+const START = { x: 640, y: 720 };
+// The three cash drops of job 4 (PAYDAY RUN).
 const DROPS = [
   { x: 1120, y: 1760 },
   { x: 2880, y: 1120 },
@@ -42,7 +49,7 @@ function pushOutOfRect(pos, r, rect) {
   let dy = pos.y - ny;
   const d2 = dx * dx + dy * dy;
   if (d2 >= r * r || d2 === 0) {
-    // Centre inside the rectangle: push out along the smallest penetration.
+    // Centre inside the rectangle: leave along the smallest penetration.
     const left = pos.x - rect.x;
     const right = rect.x + rect.w - pos.x;
     const top = pos.y - rect.y;
@@ -92,14 +99,14 @@ export function createWorld(random) {
     }
   }
 
-  // ---- entities --------------------------------------------------------------
+  // ---- entities: fixed pools, reused for the whole run ----------------------
   const player = {
     x: START.x, y: START.y, angle: 0, health: PLAYER.health, cash: 0,
     inCar: null, punchCooldown: 0, invulnerable: 0, onFoot: true,
   };
   const cars = [];
   for (let i = 0; i < 40; i += 1) {
-    cars.push({ active: false, x: 0, y: 0, angle: 0, speed: 0, parked: true, owned: false, traffic: false, axis: 'h', dir: 1, color: '#7fb3d5', hitCooldown: 0 });
+    cars.push({ active: false, x: 0, y: 0, angle: 0, speed: 0, parked: true, owned: false, traffic: false, axis: 'h', dir: 1, color: '#7fb3d5', hitCooldown: 0, damage: 0 });
   }
   const peds = [];
   for (let i = 0; i < 40; i += 1) {
@@ -110,7 +117,7 @@ export function createWorld(random) {
     cops.push({ active: false, x: 0, y: 0, angle: 0, speed: 0, inCar: false, car: null, health: 100, arrest: 0, attackTimer: 0, down: 0, downTimer: 0 });
   }
   const pickups = [];
-  for (let i = 0; i < 8; i += 1) pickups.push({ active: false, x: 0, y: 0, kind: 'cash', amount: 0 });
+  for (let i = 0; i < 8; i += 1) pickups.push({ active: false, x: 0, y: 0, kind: 'cash', amount: 0, crewIndex: -1 });
 
   const state = {
     player, cars, peds, cops, pickups, buildings, parks,
@@ -118,8 +125,10 @@ export function createWorld(random) {
     wanted: 0, time: 0, missionIndex: 0, missionStage: 0, missionTimer: 0,
     missionTarget: null, missionText: MISSIONS[0].brief, storyComplete: false,
     crimeTimer: 0, wantedTimer: 0, trafficTimer: 0, pedTimer: 0,
+    crew: [], dialogue: null, dialogueT: 0, carrying: null,
   };
 
+  // ---- small lookups ---------------------------------------------------------
   function nearestRoadX(x) {
     let best = STREETS_X[0];
     for (const s of STREETS_X) if (Math.abs(s - x) < Math.abs(best - x)) best = s;
@@ -159,6 +168,7 @@ export function createWorld(random) {
     return null;
   }
 
+  // ---- spawners --------------------------------------------------------------
   function spawnParkedCar() {
     const car = freeCar();
     if (!car) return;
@@ -268,20 +278,31 @@ export function createWorld(random) {
     state.crimeTimer = 0;
   }
 
+  function hasCrew(name) {
+    return state.crew.indexOf(name) !== -1;
+  }
+
   function missionTargetFor(index, stage) {
     if (index === 0) return null; // any car
     if (index === 1) return stage === 0 ? { x: PIER.x, y: PIER.y } : { x: GARAGE.x, y: GARAGE.y };
     if (index === 2) return { x: SAFEHOUSE.x, y: SAFEHOUSE.y };
     if (index === 3) return stage === 0 ? null : { x: GARAGE.x, y: GARAGE.y };
+    if (index === 4) return null; // crew spots, shown as pickups
+    if (index === 5) return { x: GARAGE.x, y: GARAGE.y };
+    if (index === 6) return { x: SAFEHOUSE.x, y: SAFEHOUSE.y };
+    if (index === 7) return stage === 0 ? null : { x: GARAGE.x, y: GARAGE.y };
     return null;
   }
 
   function startMission(index) {
     state.missionIndex = index;
     state.missionStage = 0;
-    state.missionTimer = index === 3 ? 120 : 0;
+    state.missionTimer = index === 3 ? 120 : index === 5 ? 90 : index === 7 ? 180 : 0;
     state.missionText = MISSIONS[index].brief;
     state.missionTarget = missionTargetFor(index, 0);
+    state.carrying = null;
+    state.dialogue = { speaker: 'MILO', text: MISSIONS[index].dialogue };
+    state.dialogueT = 9;
     if (index === 2) addWanted(3);
     if (index === 3) {
       for (const d of DROPS) {
@@ -292,6 +313,37 @@ export function createWorld(random) {
           p.y = d.y;
           p.kind = 'drop';
           p.amount = CASH.drop;
+          p.crewIndex = -1;
+        }
+      }
+    }
+    if (index === 4) {
+      // Crew call: only the members not yet recruited wait on the street.
+      for (let i = 0; i < CREW.length; i += 1) {
+        if (hasCrew(CREW[i].name)) continue;
+        const p = freePickup();
+        if (p) {
+          p.active = true;
+          p.x = CREW_SPOTS[i].x;
+          p.y = CREW_SPOTS[i].y;
+          p.kind = 'crew';
+          p.amount = 0;
+          p.crewIndex = i;
+        }
+      }
+    }
+    if (index === 5) addWanted(2);
+    if (index === 6) { state.wanted = 4; state.crimeTimer = 0; } // the job IS four stars, whatever the heat was
+    if (index === 7) {
+      for (const d of DROPS7) {
+        const p = freePickup();
+        if (p) {
+          p.active = true;
+          p.x = d.x;
+          p.y = d.y;
+          p.kind = 'drop';
+          p.amount = CASH.drop;
+          p.crewIndex = -1;
         }
       }
     }
@@ -299,6 +351,7 @@ export function createWorld(random) {
 
   function completeMission(reward) {
     player.cash += reward;
+    state.carrying = null;
     state.missionText = MISSIONS[state.missionIndex].done;
     const next = state.missionIndex + 1;
     if (next >= MISSIONS.length) {
@@ -331,6 +384,10 @@ export function createWorld(random) {
     state.wantedTimer = 0;
     state.trafficTimer = 0;
     state.pedTimer = 0;
+    state.crew = [];
+    state.dialogue = null;
+    state.dialogueT = 0;
+    state.carrying = null;
     for (let i = 0; i < 10; i += 1) spawnParkedCar();
     for (let i = 0; i < CAR.trafficCount; i += 1) spawnTrafficCar();
     for (let i = 0; i < PED.count; i += 1) spawnPed();
@@ -383,7 +440,9 @@ export function createWorld(random) {
 
   function punch() {
     if (player.punchCooldown > 0 || !player.onFoot) return 0;
-    player.punchCooldown = PLAYER.punchCooldown;
+    // RICO on the crew: harder punches, faster fists.
+    player.punchCooldown = hasCrew('RICO') ? PLAYER.punchCooldown * 0.75 : PLAYER.punchCooldown;
+    const punchDamage = hasCrew('RICO') ? PLAYER.punchDamage + 16 : PLAYER.punchDamage;
     const fx = player.x + Math.cos(player.angle) * PLAYER.punchRange;
     const fy = player.y + Math.sin(player.angle) * PLAYER.punchRange;
     let events = EVENT_PUNCH;
@@ -406,7 +465,7 @@ export function createWorld(random) {
     }
     for (const cop of cops) {
       if (cop.active && !cop.down && !cop.inCar && dist(fx, fy, cop.x, cop.y) < 40) {
-        cop.health -= PLAYER.punchDamage;
+        cop.health -= punchDamage;
         addWanted(2);
         events |= EVENT_CRIME;
         if (cop.health <= 0) {
@@ -429,15 +488,29 @@ export function createWorld(random) {
       resolveBuildings(player, PLAYER.radius);
     } else {
       const car = player.inCar;
+      // A wrecked car (damage 100) is dead: the engine turns over and nothing happens.
+      const dead = car.damage >= 100;
+      // DANA on the crew: +8% top speed on the getaway.
+      const topSpeed = CAR.maxSpeed * (hasCrew('DANA') ? 1.08 : 1);
       // Throttle: up is gas, down is brake/reverse; left/right steer, scaled by speed.
       const steer = move.x;
-      if (move.y < 0) car.speed += CAR.accel * dt;
-      else if (move.y > 0) car.speed -= (car.speed > 0 ? CAR.brake : CAR.reverseAccel) * dt;
-      else car.speed -= car.speed * 1.4 * dt; // coast down
-      if (car.speed > CAR.maxSpeed) car.speed = CAR.maxSpeed;
+      if (!dead) {
+        if (move.y < 0) car.speed += CAR.accel * dt;
+        else if (move.y > 0) car.speed -= (car.speed > 0 ? CAR.brake : CAR.reverseAccel) * dt;
+        else car.speed -= car.speed * 1.4 * dt; // coast down
+      } else car.speed -= car.speed * 2 * dt;
+      if (car.speed > topSpeed) car.speed = topSpeed;
       if (car.speed < -CAR.maxReverse) car.speed = -CAR.maxReverse;
       const steerAmount = steer * CAR.turnRate * Math.min(1, Math.abs(car.speed) / 140) * (car.speed < 0 ? -1 : 1);
       car.angle += steerAmount * dt;
+      // Smashing a building at speed wrecks the car (once per half second).
+      const nx = car.x + Math.cos(car.angle) * car.speed * dt;
+      const ny = car.y + Math.sin(car.angle) * car.speed * dt;
+      if (Math.abs(car.speed) > 220 && car.hitCooldown <= 0 && hitsBuilding(nx, ny, CAR.width / 2 + 4)) {
+        car.damage = Math.min(100, car.damage + 6);
+        car.hitCooldown = 0.5;
+      }
+      if (car.hitCooldown > 0) car.hitCooldown -= dt;
       car.x += Math.cos(car.angle) * car.speed * dt;
       car.y += Math.sin(car.angle) * car.speed * dt;
       resolveBuildings(car, CAR.width / 2 + 4);
@@ -581,9 +654,10 @@ export function createWorld(random) {
         cop.x = car.x;
         cop.y = car.y;
         cop.angle = car.angle;
-        // Ramming the player's car hurts the player.
+        // Ramming the player's car hurts the player — and wrecks their car.
         if (player.inCar && d < 56) {
           player.health -= COP.ramDamage * dt;
+          player.inCar.damage = Math.min(100, player.inCar.damage + 8 * dt);
           const a = Math.atan2(player.y - cop.y, player.x - cop.x);
           player.inCar.x += Math.cos(a) * 60 * dt;
           player.inCar.y += Math.sin(a) * 60 * dt;
@@ -615,7 +689,8 @@ export function createWorld(random) {
     const nearSafe = dist(player.x, player.y, SAFEHOUSE.x, SAFEHOUSE.y) < 160;
     if (state.crimeTimer > WANTED.decayDelay) {
       state.wantedTimer += dt;
-      const stepTime = nearSafe ? 1 : WANTED.decayStep;
+      // LENA on the crew: the heat fades almost twice as fast.
+      const stepTime = nearSafe ? 1 : hasCrew('LENA') ? 2.2 : WANTED.decayStep;
       if (state.wantedTimer >= stepTime) {
         state.wantedTimer = 0;
         state.wanted = Math.max(0, state.wanted - 1);
@@ -636,6 +711,7 @@ export function createWorld(random) {
           state.missionStage = 1;
           state.missionTarget = { x: GARAGE.x, y: GARAGE.y };
           state.missionText = 'Package in hand. Take it to Milo\u2019s garage in Old Town.';
+          state.carrying = 'PACKAGE';
           return EVENT_CASH;
         }
         return completeMission(CASH.mission2);
@@ -667,6 +743,7 @@ export function createWorld(random) {
               pk.y = d.y;
               pk.kind = 'drop';
               pk.amount = CASH.drop;
+              pk.crewIndex = -1;
             }
           }
           state.missionText = 'Too slow — the drops moved. Two minutes, from the top.';
@@ -677,14 +754,68 @@ export function createWorld(random) {
       }
       return 0;
     }
+    if (state.missionIndex === 4) {
+      // CREW CALL: all three members recruited, job done.
+      let left = 0;
+      for (const pk of pickups) if (pk.active && pk.kind === 'crew') left += 1;
+      if (left === 0 && state.crew.length >= CREW.length) return completeMission(CASH.mission5);
+      return 0;
+    }
+    if (state.missionIndex === 5) {
+      // THE VAULT: ninety seconds to reach the garage with the PD on you.
+      state.missionTimer -= dt;
+      const t = state.missionTarget;
+      if (t && dist(p.x, p.y, t.x, t.y) < 70) return completeMission(CASH.mission6);
+      if (state.missionTimer <= 0) {
+        state.missionTimer = 90;
+        addWanted(1);
+        state.missionText = 'Too slow — the vault crew is nervous. Ninety seconds, from the top.';
+      }
+      return 0;
+    }
+    if (state.missionIndex === 6) {
+      // AIR SUPPORT: lose the 4-star heat, then reach the safehouse.
+      const t = state.missionTarget;
+      if (t && dist(p.x, p.y, t.x, t.y) < 90 && state.wanted === 0) return completeMission(CASH.mission7);
+      return 0;
+    }
+    if (state.missionIndex === 7) {
+      // THE BIG SCORE: four drops in three minutes, then to Milo.
+      state.missionTimer -= dt;
+      if (state.missionStage === 0) {
+        let left = 0;
+        for (const pk of pickups) if (pk.active && pk.kind === 'drop') left += 1;
+        if (left === 0) {
+          state.missionStage = 1;
+          state.missionTarget = { x: GARAGE.x, y: GARAGE.y };
+          state.missionText = 'All four drops collected. Bring the cash to Milo\u2019s garage.';
+        } else if (state.missionTimer <= 0) {
+          state.missionTimer = 180;
+          for (const d of DROPS7) {
+            const pk = freePickup();
+            if (pk) {
+              pk.active = true;
+              pk.x = d.x;
+              pk.y = d.y;
+              pk.kind = 'drop';
+              pk.amount = CASH.drop;
+              pk.crewIndex = -1;
+            }
+          }
+          state.missionText = 'Too slow — the drops moved. Three minutes, from the top.';
+        }
+      } else {
+        const t = state.missionTarget;
+        if (t && dist(p.x, p.y, t.x, t.y) < 70) return completeMission(CASH.mission8);
+      }
+      return 0;
+    }
     return 0;
   }
 
-  /**
-   * One fixed step. `input` is { move: {x, y, run, active}, enter, punch }.
-   * With `harmless` set (the title screen's backdrop) the city lives but nothing
-   * touches the player and nothing scores.
-   */
+  // One fixed step. `input` is { move: {x, y, run, active}, enter, punch }.
+  // With `harmless` set (the title screen's backdrop) the city lives but
+  // nothing touches the player and nothing scores.
   function step(dt, input, harmless) {
     let events = 0;
     state.time += dt;
@@ -695,9 +826,19 @@ export function createWorld(random) {
       }
       if (input.punch) events |= punch();
       stepPlayer(dt, input.move);
-      // Cash and drops on the ground.
+      // Cash, drops and crew on the ground.
       for (const pk of pickups) {
         if (pk.active && dist(player.x, player.y, pk.x, pk.y) < 44) {
+          if (pk.kind === 'crew') {
+            pk.active = false;
+            const member = CREW[pk.crewIndex];
+            if (member && !hasCrew(member.name)) {
+              state.crew.push(member.name);
+              state.missionText = `${member.name} joined the crew — ${member.role}, ${member.perk}.`;
+            }
+            events |= EVENT_CASH;
+            continue;
+          }
           pk.active = false;
           player.cash += pk.amount;
           events |= EVENT_CASH;
@@ -721,6 +862,7 @@ export function createWorld(random) {
     }
     stepTraffic(dt);
     stepPeds(dt);
+    if (state.dialogueT > 0) state.dialogueT -= dt;
     // Keep the streets busy.
     state.trafficTimer -= dt;
     if (state.trafficTimer <= 0) {
@@ -740,12 +882,13 @@ export function createWorld(random) {
   }
 
   function serialize() {
-    return { cash: player.cash, missionIndex: state.missionIndex, storyComplete: state.storyComplete };
+    return { cash: player.cash, missionIndex: state.missionIndex, storyComplete: state.storyComplete, crew: state.crew.slice() };
   }
 
   function loadSave(data) {
     if (!data) return;
     player.cash = data.cash || 0;
+    state.crew = Array.isArray(data.crew) ? data.crew.filter((n) => CREW.some((c) => c.name === n)) : [];
     state.storyComplete = !!data.storyComplete;
     const index = Math.min(data.missionIndex || 0, MISSIONS.length - 1);
     if (state.storyComplete) {
@@ -778,17 +921,32 @@ export function createWorld(random) {
         car.y = 1760;
         car.angle = Math.PI / 2;
         car.speed = 300;
+        car.damage = 0;
         player.x = car.x;
         player.y = car.y;
         player.angle = car.angle;
+      }
+      if (kind === 'chase') {
+        // THE BIG SCORE, the final job: full crew aboard, four stars, CONDOR-1
+        // overhead, four drops across the city and the clock running.
+        startMission(7);
+        state.crew = CREW.map((c) => c.name);
+        state.wanted = 4;
+        state.crimeTimer = 0;
+        player.cash = 1250;
+        player.health = 82;
+        for (let i = 0; i < 4; i += 1) spawnCop();
+        return;
       }
       state.missionIndex = 1;
       state.missionStage = 0;
       state.missionText = MISSIONS[1].brief;
       state.missionTarget = { x: PIER.x, y: PIER.y };
-      state.wanted = kind === 'chase' ? 4 : 2;
+      state.dialogue = { speaker: 'MILO', text: MISSIONS[1].dialogue };
+      state.dialogueT = 9;
+      state.wanted = 2;
       state.crimeTimer = 0;
-      for (let i = 0; i < (kind === 'chase' ? 4 : 2); i += 1) spawnCop();
+      for (let i = 0; i < 2; i += 1) spawnCop();
       return;
     }
     if (kind === 'end') {
