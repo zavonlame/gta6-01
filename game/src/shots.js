@@ -1,125 +1,116 @@
-// The screenshot scenes behind ?shot=start|play|chase|end. Each one stages
-// the real world, then plays the real rules forward for a fixed number of
-// steps under a simple autopilot (drive toward the mission marker), so the
-// frame is what a short game really looks like — and the same seed always
-// gives the same frame.
-//
-// The shot order lives in shots.json, not here: the chase is the cover
-// (image 1), the drive and the busted screen follow, and the start screen
-// goes last — a menu alone never leads the set.
-import { STEP } from './config.js';
-import { EVENT_BUSTED, EVENT_WASTED } from './world.js';
-import { SCREEN_BUSTED, SCREEN_PLAY, SCREEN_TITLE } from './render.js';
+// shots.js — one job: stage the four screenshots.
+// ?shot=chase | foot | race | start (plus ?seed=) puts the game in a
+// fixed, deterministic pose and renders one frame, so every screenshot
+// is a real render of the game's own code. Chase is the cover: mission 6
+// mid-escape, four stars, CONDOR-1 overhead, dispatch board, crew cards,
+// dialogue, weapon slots, radio, minimap, speed and a burning wreck.
+import { PLACES } from './world.js';
+import { FIXER } from './missions.js';
+import { CARS } from './config.js';
 
-const START_SECONDS = 6;
-const PLAY_SECONDS = 14;
-const CHASE_SECONDS = 10;
-
-// Steer a car toward a point, returning the {x, y} move input for one world step.
-function driveToward(world, tx, ty) {
-  const p = world.state.player;
-  const car = p.inCar;
-  if (!car) return { x: 0, y: 0, run: false, active: false };
-  // No fixed target (a drops job): chase the nearest cash drop instead.
-  if (tx === null || tx === undefined || ty === null || ty === undefined) {
-    let best = null;
-    let bestD = Infinity;
-    for (const pk of world.state.pickups) {
-      if (!pk.active || pk.kind !== 'drop') continue;
-      const d = Math.hypot(pk.x - car.x, pk.y - car.y);
-      if (d < bestD) {
-        bestD = d;
-        best = pk;
-      }
-    }
-    if (best) {
-      tx = best.x;
-      ty = best.y;
-    } else {
-      tx = world.places.GARAGE.x;
-      ty = world.places.GARAGE.y;
-    }
-  }
-  const heading = Math.atan2(ty - car.y, tx - car.x);
-  let turn = heading - car.angle;
-  while (turn > Math.PI) turn -= Math.PI * 2;
-  while (turn < -Math.PI) turn += Math.PI * 2;
-  const steer = turn > 0.25 ? 1 : turn < -0.25 ? -1 : 0;
-  return { x: steer, y: -1, run: false, active: true };
+export function shotFromUrl() {
+  const q = new URLSearchParams(window.location.search);
+  return q.get('shot') || null;
 }
 
-// Put `world` into the named scene (start, play, chase or end; any other
-// name is start) and return the screen to draw over it and the best cash to show.
-export function stageShot(name, world) {
-  world.stage(name === 'play' || name === 'chase' || name === 'end' ? name : 'start');
-  if (name !== 'play' && name !== 'chase' && name !== 'end') {
-    for (let i = 0; i < START_SECONDS / STEP; i += 1) {
-      world.step(STEP, { move: { x: 0, y: 0, run: false, active: false }, enter: false, punch: false }, true);
-    }
-    return { screen: SCREEN_TITLE, best: 0 };
-  }
-  if (name === 'end') {
-    // Let the cops close in until the bust lands, then hold the busted screen.
-    let busted = false;
-    for (let i = 0; i < 60 / STEP && !busted; i += 1) {
-      const events = world.step(STEP, { move: { x: 0, y: 0, run: false, active: false }, enter: false, punch: false }, false);
-      if (events & EVENT_BUSTED || events & EVENT_WASTED) busted = true;
-    }
-    return { screen: SCREEN_BUSTED, best: world.state.player.cash };
-  }
-  const seconds = name === 'chase' ? CHASE_SECONDS : PLAY_SECONDS;
-  const target = world.state.missionTarget;
-  for (let i = 0; i < seconds / STEP; i += 1) {
-    world.step(STEP, { move: driveToward(world, target ? target.x : null, target ? target.y : null), enter: false, punch: false }, false);
-  }
+// The four staged shots, in dossier order: chase is the cover.
+export const SHOT_LIST = ['chase', 'foot', 'race', 'start'];
+
+export function seedFromUrl() {
+  const q = new URLSearchParams(window.location.search);
+  const s = parseInt(q.get('seed') || '7', 10);
+  return Number.isFinite(s) ? s : 7;
+}
+
+export function applyShot(state, name) {
+  state.shot = name;
+  const p = state.player;
   if (name === 'chase') {
-    // Hold the frame until a cop car is inside the camera window, so the
-    // cover shows the chase and not an empty road — at most a few extra seconds.
-    const p = world.state.player;
-    let inFrame = false;
-    for (let extra = 0; extra < 6 / STEP && !inFrame; extra += 1) {
-      world.step(STEP, { move: driveToward(world, target ? target.x : null, target ? target.y : null), enter: false, punch: false }, false);
-      for (const cop of world.state.cops) {
-        if (cop.active && cop.inCar && Math.abs(cop.x - p.x) < 640 && Math.abs(cop.y - p.y) < 360) inFrame = true;
-      }
-    }
-    // The cover frame: Milo's line stays up, and the getaway car shows the
-    // wear of the chase (the rams of the last ten seconds already did most of it).
-    world.state.dialogueT = 30;
-    // Final pose, on the beach road and moving: the autopilot has no
-    // obstacle avoidance, so after sixteen seconds it may have wedged the
-    // car into a building and let the cops wreck it to a standstill — a
-    // dead car at 0 mph is not a chase cover. Put the getaway back on the
-    // road, cops on its tail.
-    const car = p.inCar;
-    if (car) {
-      car.x = 1400;
-      car.y = 1760;
-      car.angle = Math.PI;
-      car.speed = 470;
-      if (car.damage !== 28) car.damage = 28;
-      p.x = car.x;
-      p.y = car.y;
-      p.angle = car.angle;
-      p.health = 82;
-    }
-    world.state.wanted = 4;
-    world.state.crimeTimer = 0;
-    let n = 0;
-    for (const cop of world.state.cops) {
-      if (!cop.active || !cop.inCar || !cop.car) continue;
-      cop.car.x = 1580 + n * 150;
-      cop.car.y = 1760 + (n % 2 === 0 ? 18 : -18);
-      cop.car.angle = Math.PI;
-      cop.car.speed = 430;
-      cop.x = cop.car.x;
-      cop.y = cop.car.y;
-      cop.angle = Math.PI;
-      n += 1;
-      if (n >= 3) break;
-    }
-  } else {
-    world.state.dialogueT = 9;
+    state.mode = 'play';
+    state.missionIndex = 5;
+    state.stageIndex = 1;
+    state.money = 18450;
+    state.respect = 320;
+    state.standing = 'RESPECTED';
+    p.x = 1800; p.y = 1800;
+    p.angle = Math.PI / 4;
+    p.speed = 51; // ~112 km/h on the HUD
+    p.inCar = true;
+    p.car = { name: 'Vantara GT', model: CARS[0], color: '#c22f2f', condition: 62, top: 430 };
+    p.hp = 78; p.armour = 55;
+    state.police.heat = 88;
+    state.police.recalc();
+    state.police.heli.active = true;
+    state.police.heli.x = p.x + 60;
+    state.police.heli.y = p.y - 260;
+    state.police.cruisers.push(
+      { x: p.x - 260, y: p.y - 180, angle: 0.6, speed: 300, hp: 100 },
+      { x: p.x + 320, y: p.y + 120, angle: -2.4, speed: 310, hp: 100 },
+      { x: p.x - 120, y: p.y + 300, angle: 1.8, speed: 290, hp: 100 },
+    );
+    state.police.roadblocks.push({ x: p.x + 420, y: p.y - 260 });
+    state.wrecks.push({ x: p.x - 420, y: p.y + 180, angle: 0.9 });
+    state.dialogue = {
+      name: FIXER.name, role: FIXER.role, color: '#f7b733',
+      text: 'Vault cut is live, kid. Tess cracked the door — now drive like the whole city is watching. Because it is.',
+    };
+    state.weapon = 2;
+    state.toast = 'THE VAULT CUT — escape the dragnet';
+    state.time = 4.2;
+  } else if (name === 'foot') {
+    state.mode = 'play';
+    state.missionIndex = 1;
+    state.stageIndex = 0;
+    state.money = 1050;
+    state.respect = 65;
+    state.standing = 'NEUTRAL';
+    p.x = 450; p.y = 3150;
+    p.angle = -Math.PI / 2;
+    p.speed = 0;
+    p.inCar = false;
+    p.car = null;
+    p.hp = 100; p.armour = 25;
+    state.police.heat = 22;
+    state.police.recalc();
+    state.police.cruisers.push({ x: p.x + 420, y: p.y - 260, angle: 2.6, speed: 200, hp: 100 });
+    state.dialogue = {
+      name: FIXER.name, role: FIXER.role, color: '#f7b733',
+      text: 'Package is at the end of the pier. Walk in quiet, walk out with it. No sirens, no heroes.',
+    };
+    state.weapon = 1;
+    state.toast = 'THE PIER DROP — on foot at the Old Pier';
+    state.time = 2.0;
+  } else if (name === 'race') {
+    state.mode = 'play';
+    state.missionIndex = 7;
+    state.stageIndex = 0;
+    state.money = 12300;
+    state.respect = 210;
+    state.standing = 'KNOWN';
+    p.x = 900; p.y = 2700;
+    p.angle = 0;
+    p.speed = 58; // ~128 km/h
+    p.inCar = true;
+    p.car = { name: 'Night Comet', model: CARS[5], color: '#23232e', condition: 91, top: 460 };
+    p.hp = 100; p.armour = 80;
+    state.police.heat = 0;
+    state.police.recalc();
+    state.race = { gates: 3, gate: 1, started: true };
+    state.dialogue = {
+      name: 'Juno Park', role: 'DRIVER', color: '#7ddc7d',
+      text: 'Three gates to the pier and the sun is dropping. Keep it pinned — I did not tune this Comet to lose.',
+    };
+    state.weapon = 0;
+    state.toast = 'RACE THE SUN — gate 1 of 3';
+    state.time = 6.5;
+  } else if (name === 'start') {
+    state.mode = 'title';
+    state.slots = [
+      { money: 18450, missionIndex: 5, respect: 320 },
+      { money: 1050, missionIndex: 1, respect: 65 },
+      null,
+    ];
+    state.time = 0;
   }
-  return { screen: SCREEN_PLAY, best: world.state.player.cash };
+  state.shotReady = true;
 }

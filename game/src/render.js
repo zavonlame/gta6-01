@@ -1,944 +1,721 @@
-// Rendering: state in, pixels out. Nothing here makes decisions.
-//
-// The view is a pseudo-3D golden-hour chase frame built on the same 2D
-// simulation: a sunset sky with a low sun and a far skyline above the
-// horizon, and below it the city in a tilted perspective — the world is
-// squashed vertically so the streets run away from the camera. Buildings
-// become 3D blocks with roofs, side faces and long sunset shadows; cars get
-// roofs and shadows; CONDOR-1 circles overhead with a searchlight whenever
-// the heat reaches three stars. The camera tracks the player. The rules
-// never see any of this, so the game plays exactly as it would top-down.
-//
-// The HUD is the face of the game: cash, district and respect, wanted
-// stars, health, the clock and weather, a mission tracker naming the job
-// and its stage, Milo's dialogue box with his portrait, the police-dispatch
-// panel naming every unit on the chase, three crew cards, the radio panel,
-// a weapon strip with the inventory, speed and car damage, the off-screen
-// objective arrow, and the minimap. Each panel only reads state the world
-// already keeps — the HUD shows rules, it adds none.
-import { CAR, CREW, DISPATCH_CALLSIGNS, FONT, MISSIONS, MISSION_STAGES, PALETTE, PED, PLAYER, RESPECT_RANKS, VIEW, WEAPON, WORLD } from './config.js';
+// render.js — one job: paint everything the player sees.
+// Golden-hour sky and skyline, the isometric city with extruded
+// buildings, traffic, people, police, helicopter and smoke, then the
+// whole HUD: mission tracker, dispatch board, crew cards, minimap,
+// weapon slots, radio line, speed, health and armour, dialogue, toasts
+// and the title screen. All canvas, so screenshots capture the game.
+import { CFG, PAL, DISTRICTS, WEAPONS, respectRank } from './config.js';
+import { districtAt, PLACES } from './world.js';
+import { missionAt, stageAt, nextObjective } from './missions.js';
+import { CREW } from './crew.js';
 
-export const SCREEN_TITLE = 'title';
-export const SCREEN_PLAY = 'play';
-export const SCREEN_PAUSED = 'paused';
-export const SCREEN_BUSTED = 'busted';
-export const SCREEN_WASTED = 'wasted';
-export const SCREEN_COMPLETE = 'complete';
-
-// Sky band height, in view units; the world is painted below the horizon.
-const SKY_H = 120;
-// How much the world is squashed vertically: the tilt that sends streets
-// running away from the camera.
-const SQ = 0.62;
-// Roof offset, in world units: the sideways shift that gives a block a side face.
-const ROOF_SHIFT = 12;
-
-const PANEL = { width: 680, top: 150, line: 32, bottom: 76 };
-const MINI = { width: 230, height: 154, margin: 16 };
-const DISPATCH = { x: 16, y: 180, width: 308, header: 26, row: 20, pad: 10, maxRows: 4 };
-const TRACKER = { width: 560, height: 52, top: 56 };
-const WEAPON_STRIP = { width: 230, height: 48, gap: 8 };
-const DIALOGUE = { width: 600, top: 116, height: 58 };
-const CREW_CARD = { y: 608, width: 156, height: 48, gap: 8 };
-const RADIO_PANEL = { width: 230, height: 42 };
-
-function clamp(value, min, max) {
-  return Math.max(min, Math.min(max, value));
+// Isometric 2:1 projection. wz lifts things off the ground (buildings,
+// the helicopter, the objective beacon).
+export function project(wx, wy, wz) {
+  return { x: (wx - wy) * 0.5, y: (wx + wy) * 0.25 - (wz || 0) };
 }
 
-// A hex colour scaled brighter (f > 1) or darker (f < 1).
-function shade(hex, f) {
+function camProject(state) {
+  return project(state.player.x, state.player.y, 0);
+}
+
+export function draw(ctx, state) {
+  const W = CFG.canvasW;
+  const H = CFG.canvasH;
+  if (state.mode === 'title') { drawTitle(ctx, state); return; }
+  drawSky(ctx, state);
+  drawGround(ctx, state);
+  drawWorld(ctx, state);
+  drawEntities(ctx, state);
+  drawEffects(ctx, state);
+  drawHud(ctx, state);
+  if (state.paused) drawPaused(ctx);
+  if (state.banner) drawBanner(ctx, state);
+}
+
+function drawSky(ctx, state) {
+  const W = CFG.canvasW;
+  const g = ctx.createLinearGradient(0, 0, 0, 300);
+  g.addColorStop(0, PAL.skyTop);
+  g.addColorStop(0.55, PAL.skyMid);
+  g.addColorStop(1, PAL.skyLow);
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, W, 300);
+  // Low sun, upper right.
+  ctx.fillStyle = PAL.sun;
+  ctx.beginPath();
+  ctx.arc(W - 210, 108, 42, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.fillStyle = 'rgba(255,217,138,0.25)';
+  ctx.beginPath();
+  ctx.arc(W - 210, 108, 74, 0, Math.PI * 2);
+  ctx.fill();
+  // Skyline silhouettes.
+  ctx.fillStyle = 'rgba(46,32,58,0.85)';
+  let x = 0;
+  let i = 0;
+  while (x < W) {
+    const bw = 46 + ((i * 53) % 60);
+    const bh = 60 + ((i * 37) % 90);
+    ctx.fillRect(x, 300 - bh, bw, bh);
+    x += bw + 8;
+    i++;
+  }
+  ctx.fillStyle = 'rgba(46,32,58,0.55)';
+  ctx.fillRect(0, 296, W, 6);
+}
+
+function drawGround(ctx, state) {
+  const W = CFG.canvasW;
+  const H = CFG.canvasH;
+  const cam = camProject(state);
+  const cx = W / 2 - cam.x;
+  const cy = 300 - cam.y + 130;
+  ctx.save();
+  ctx.fillStyle = '#6d8a4a';
+  ctx.fillRect(0, 300, W, H - 300);
+  // Everything flat on the ground stays below the horizon line, so no
+  // road ever floats up into the sky.
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(0, 298, W, H - 298);
+  ctx.clip();
+  // Beach along the west edge (world x small).
+  const b0 = project(0, 0, 0);
+  const b1 = project(0, CFG.worldH, 0);
+  const b2 = project(360, CFG.worldH, 0);
+  const b3 = project(360, 0, 0);
+  ctx.fillStyle = PAL.sand;
+  ctx.beginPath();
+  ctx.moveTo(cx + b0.x, cy + b0.y);
+  ctx.lineTo(cx + b1.x, cy + b1.y);
+  ctx.lineTo(cx + b2.x, cy + b2.y);
+  ctx.lineTo(cx + b3.x, cy + b3.y);
+  ctx.closePath();
+  ctx.fill();
+  // Sea beyond the beach.
+  ctx.fillStyle = PAL.sea;
+  ctx.beginPath();
+  ctx.moveTo(cx + b0.x, cy + b0.y);
+  ctx.lineTo(cx + b1.x, cy + b1.y);
+  ctx.lineTo(cx + b1.x - 400, cy + b1.y + 200);
+  ctx.lineTo(cx + b0.x - 400, cy + b0.y - 200);
+  ctx.closePath();
+  ctx.fill();
+  // Roads: dark quads along each grid line.
+  ctx.fillStyle = PAL.road;
+  for (let gx = 0; gx <= CFG.worldW; gx += CFG.roadGap) {
+    roadQuad(ctx, cx, cy, gx, 0, gx, CFG.worldH, CFG.roadW);
+  }
+  for (let gy = 0; gy <= CFG.worldH; gy += CFG.roadGap) {
+    roadQuad(ctx, cx, cy, 0, gy, CFG.worldW, gy, CFG.roadW);
+  }
+  // Centre dashes.
+  ctx.strokeStyle = PAL.roadLine;
+  ctx.lineWidth = 2;
+  ctx.setLineDash([14, 18]);
+  for (let gx = 0; gx <= CFG.worldW; gx += CFG.roadGap) {
+    const a = project(gx, 0, 0);
+    const b = project(gx, CFG.worldH, 0);
+    ctx.beginPath();
+    ctx.moveTo(cx + a.x, cy + a.y);
+    ctx.lineTo(cx + b.x, cy + b.y);
+    ctx.stroke();
+  }
+  for (let gy = 0; gy <= CFG.worldH; gy += CFG.roadGap) {
+    const a = project(0, gy, 0);
+    const b = project(CFG.worldW, gy, 0);
+    ctx.beginPath();
+    ctx.moveTo(cx + a.x, cy + a.y);
+    ctx.lineTo(cx + b.x, cy + b.y);
+    ctx.stroke();
+  }
+  ctx.setLineDash([]);
+  ctx.restore();
+  ctx.restore();
+  state._screen = { cx, cy };
+}
+
+function roadQuad(ctx, cx, cy, x0, y0, x1, y1, w) {
+  const p0 = project(x0, y0, 0);
+  const p1 = project(x1, y1, 0);
+  const dx = p1.x - p0.x;
+  const dy = p1.y - p0.y;
+  const len = Math.hypot(dx, dy) || 1;
+  const nx = (-dy / len) * (w / 2);
+  const ny = (dx / len) * (w / 2);
+  ctx.beginPath();
+  ctx.moveTo(cx + p0.x + nx, cy + p0.y + ny);
+  ctx.lineTo(cx + p1.x + nx, cy + p1.y + ny);
+  ctx.lineTo(cx + p1.x - nx, cy + p1.y - ny);
+  ctx.lineTo(cx + p0.x - nx, cy + p0.y - ny);
+  ctx.closePath();
+  ctx.fill();
+}
+
+function toScreen(state, wx, wy, wz) {
+  const s = state._screen || { cx: 640, cy: 300 };
+  const p = project(wx, wy, wz || 0);
+  return { x: s.cx + p.x, y: s.cy + p.y };
+}
+
+function drawWorld(ctx, state) {
+  const world = state.world;
+  const items = [];
+  for (const b of world.buildings) items.push({ k: b.x + b.y, b });
+  items.sort((a, b2) => a.k - b2.k);
+  for (const { b } of items) drawBuilding(ctx, state, b);
+  for (const p of world.palms) drawPalm(ctx, state, p);
+}
+
+function drawBuilding(ctx, state, b) {
+  const base = toScreen(state, b.x, b.y, 0);
+  const p1 = toScreen(state, b.x + b.w, b.y, 0);
+  const p2 = toScreen(state, b.x + b.w, b.y + b.h, 0);
+  const p3 = toScreen(state, b.x, b.y + b.h, 0);
+  const z = b.z;
+  // Walls: two visible faces, then the roof on top.
+  ctx.fillStyle = PAL[b.wall];
+  ctx.beginPath();
+  ctx.moveTo(p2.x, p2.y);
+  ctx.lineTo(p3.x, p3.y);
+  ctx.lineTo(p3.x, p3.y - z);
+  ctx.lineTo(p2.x, p2.y - z);
+  ctx.closePath();
+  ctx.fill();
+  ctx.fillStyle = shade(PAL[b.wall], -18);
+  ctx.beginPath();
+  ctx.moveTo(p1.x, p1.y);
+  ctx.lineTo(p2.x, p2.y);
+  ctx.lineTo(p2.x, p2.y - z);
+  ctx.lineTo(p1.x, p1.y - z);
+  ctx.closePath();
+  ctx.fill();
+  ctx.fillStyle = PAL[b.roof];
+  ctx.beginPath();
+  ctx.moveTo(base.x, base.y - z);
+  ctx.lineTo(p1.x, p1.y - z);
+  ctx.lineTo(p2.x, p2.y - z);
+  ctx.lineTo(p3.x, p3.y - z);
+  ctx.closePath();
+  ctx.fill();
+  // Windows on the tall face.
+  ctx.fillStyle = 'rgba(255,220,140,0.75)';
+  const rows = Math.max(1, Math.floor(z / 26));
+  for (let r = 0; r < rows; r++) {
+    const wy = p2.y - 12 - r * 24;
+    ctx.fillRect(p2.x - 14, wy, 5, 8);
+    ctx.fillRect(p2.x - 26, wy, 5, 8);
+  }
+}
+
+function drawPalm(ctx, state, p) {
+  const s = toScreen(state, p.x, p.y, 0);
+  ctx.strokeStyle = '#7a5a34';
+  ctx.lineWidth = 3;
+  ctx.beginPath();
+  ctx.moveTo(s.x, s.y);
+  ctx.lineTo(s.x + 2, s.y - 26);
+  ctx.stroke();
+  ctx.fillStyle = PAL.palm;
+  for (let i = 0; i < 5; i++) {
+    const a = (i / 5) * Math.PI * 2;
+    ctx.beginPath();
+    ctx.ellipse(s.x + 2 + Math.cos(a) * 10, s.y - 28 + Math.sin(a) * 5, 11, 4, a, 0, Math.PI * 2);
+    ctx.fill();
+  }
+}
+
+function shade(hex, amt) {
   const n = parseInt(hex.slice(1), 16);
-  const r = clamp(Math.round(((n >> 16) & 255) * f), 0, 255);
-  const g = clamp(Math.round(((n >> 8) & 255) * f), 0, 255);
-  const b = clamp(Math.round((n & 255) * f), 0, 255);
-  return `rgb(${r},${g},${b})`;
+  const r = Math.max(0, Math.min(255, (n >> 16) + amt));
+  const g = Math.max(0, Math.min(255, ((n >> 8) & 255) + amt));
+  const b = Math.max(0, Math.min(255, (n & 255) + amt));
+  return 'rgb(' + r + ',' + g + ',' + b + ')';
 }
 
-// A deterministic hash of a building's position, so its windows never flicker.
-function hash(x, y) {
-  let h = (x * 374761393 + y * 668265263) | 0;
-  h = (h ^ (h >> 13)) | 0;
-  return ((h * 1274126177) | 0) >>> 0;
+function drawCarShape(ctx, s, angle, color, wreck) {
+  ctx.save();
+  ctx.translate(s.x, s.y);
+  ctx.rotate(angle * 0.5 + Math.PI / 4);
+  ctx.fillStyle = 'rgba(0,0,0,0.3)';
+  ctx.fillRect(-16, -8, 34, 18);
+  ctx.fillStyle = wreck ? '#3a3a3a' : color;
+  ctx.fillRect(-16, -9, 32, 18);
+  ctx.fillStyle = 'rgba(180,220,255,0.85)';
+  ctx.fillRect(-2, -7, 8, 14);
+  ctx.fillStyle = wreck ? '#ff7a2a' : '#ffd23e';
+  ctx.fillRect(14, -7, 3, 4);
+  ctx.fillRect(14, 3, 3, 4);
+  ctx.restore();
 }
 
-// Which district the player is standing in, from the city map.
-function districtFor(x, y) {
-  if (y > WORLD.beachY) return 'THE PIER · BEACHFRONT';
-  if (x > 3000 && y < 900) return 'MARINA';
-  if (x < 1400 && y < 1100) return 'OLD TOWN';
-  if (x >= 1760 && x <= 2080 && y >= 1120 && y <= 1440) return 'PARKSIDE';
-  if (y < 1400) return 'DOWNTOWN';
-  return 'SOUTHSIDE';
-}
-
-// The in-game clock: golden hour opens at 18:00 and runs half a minute per second.
-function clockString(time) {
-  const total = 18 * 60 + Math.floor(time * 0.5);
-  const hh = Math.floor(total / 60) % 24;
-  const mm = total % 60;
-  return `${String(hh).padStart(2, '0')}:${String(mm).padStart(2, '0')}`;
-}
-
-// Where CONDOR-1 circles while the heat is on: above the player, as a ground position.
-function heliGroundPos(state) {
+function drawEntities(ctx, state) {
+  const world = state.world;
   const p = state.player;
-  return {
-    x: p.x + Math.cos(state.time * 0.6) * 230,
-    y: p.y + Math.sin(state.time * 0.6) * 170,
-  };
+  // Objective beacon.
+  const mission = missionAt(state.missionIndex);
+  const stage = stageAt(mission, state.stageIndex);
+  if (stage && stage.x !== undefined) {
+    const s = toScreen(state, stage.x, stage.y, 0);
+    const bob = Math.sin(state.time * 3) * 6;
+    ctx.fillStyle = 'rgba(247,183,51,0.25)';
+    ctx.beginPath();
+    ctx.ellipse(s.x, s.y, 26, 10, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = PAL.hudEdge;
+    ctx.fillRect(s.x - 3, s.y - 90 + bob, 6, 70);
+    ctx.beginPath();
+    ctx.moveTo(s.x, s.y - 96 + bob);
+    ctx.lineTo(s.x - 10, s.y - 78 + bob);
+    ctx.lineTo(s.x + 10, s.y - 78 + bob);
+    ctx.closePath();
+    ctx.fill();
+  }
+  for (const c of world.traffic) {
+    if (c.wreck) continue;
+    drawCarShape(ctx, toScreen(state, c.x, c.y, 0), c.angle, c.color, false);
+  }
+  // Named-place labels so the city reads as places, not just blocks.
+  ctx.font = 'bold 11px sans-serif';
+  ctx.textAlign = 'center';
+  for (const key of Object.keys(PLACES)) {
+    const pl = PLACES[key];
+    const s = toScreen(state, pl.x, pl.y, 0);
+    if (s.x < -40 || s.x > CFG.canvasW + 40 || s.y < 300 || s.y > CFG.canvasH) continue;
+    ctx.fillStyle = 'rgba(12,14,22,0.7)';
+    const w = ctx.measureText(pl.name).width + 12;
+    ctx.fillRect(s.x - w / 2, s.y - 26, w, 16);
+    ctx.fillStyle = '#ffd98a';
+    ctx.fillText(pl.name, s.x, s.y - 22);
+  }
+  ctx.textAlign = 'left';
+  for (const ped of world.peds) {
+    const s = toScreen(state, ped.x, ped.y, 0);
+    ctx.fillStyle = 'hsl(' + ped.hue + ',60%,55%)';
+    ctx.beginPath();
+    ctx.arc(s.x, s.y - 8, 4, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillRect(s.x - 3, s.y - 5, 6, 8);
+  }
+  for (const rb of state.police.roadblocks) {
+    const s = toScreen(state, rb.x, rb.y, 0);
+    ctx.fillStyle = '#ff5a4e';
+    ctx.fillRect(s.x - 22, s.y - 6, 44, 8);
+    ctx.fillStyle = '#fff';
+    ctx.fillRect(s.x - 22, s.y - 6, 8, 8);
+    ctx.fillRect(s.x - 6, s.y - 6, 8, 8);
+    ctx.fillRect(s.x + 10, s.y - 6, 8, 8);
+  }
+  for (const c of state.police.cruisers) {
+    drawCarShape(ctx, toScreen(state, c.x, c.y, 0), c.angle, '#20242e', false);
+    const s = toScreen(state, c.x, c.y, 0);
+    ctx.fillStyle = '#fff';
+    ctx.fillRect(s.x - 8, s.y - 14, 16, 3);
+    ctx.fillStyle = (Math.floor(state.time * 4) % 2 === 0) ? '#ff3b30' : '#3b82ff';
+    ctx.beginPath();
+    ctx.arc(s.x - 6, s.y - 13, 3, 0, Math.PI * 2);
+    ctx.arc(s.x + 6, s.y - 13, 3, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  // Burning wrecks.
+  for (const w of state.wrecks) {
+    const s = toScreen(state, w.x, w.y, 0);
+    drawCarShape(ctx, s, w.angle, '#222', true);
+    ctx.fillStyle = 'rgba(255,110,30,0.9)';
+    ctx.beginPath();
+    ctx.arc(s.x, s.y - 8, 8 + Math.sin(state.time * 9 + w.x) * 2, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  // Player: on foot a walker, in a car the car.
+  const ps = toScreen(state, p.x, p.y, 0);
+  if (p.inCar && p.car) {
+    drawCarShape(ctx, ps, p.angle, p.car.color, false);
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 11px sans-serif';
+    ctx.fillText('YOU', ps.x - 12, ps.y - 20);
+  } else {
+    ctx.fillStyle = '#ffd23e';
+    ctx.beginPath();
+    ctx.arc(ps.x, ps.y - 10, 5, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = '#2f6fb2';
+    ctx.fillRect(ps.x - 4, ps.y - 6, 8, 12);
+  }
+  // Helicopter with searchlight cone.
+  if (state.police.heli.active) {
+    const h = toScreen(state, state.police.heli.x, state.police.heli.y, 190);
+    const g = toScreen(state, p.x, p.y, 0);
+    ctx.fillStyle = 'rgba(255,244,180,0.20)';
+    ctx.beginPath();
+    ctx.moveTo(h.x - 14, h.y + 8);
+    ctx.lineTo(g.x - 70, g.y + 10);
+    ctx.lineTo(g.x + 70, g.y + 10);
+    ctx.closePath();
+    ctx.fill();
+    ctx.fillStyle = 'rgba(255,244,180,0.5)';
+    ctx.beginPath();
+    ctx.ellipse(g.x, g.y, 46, 14, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = '#22242e';
+    ctx.beginPath();
+    ctx.ellipse(h.x, h.y, 26, 10, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.strokeStyle = '#22242e';
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.moveTo(h.x - 30, h.y - 2);
+    ctx.lineTo(h.x + 30, h.y - 2);
+    ctx.stroke();
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 11px sans-serif';
+    ctx.fillText('CONDOR-1', h.x - 28, h.y - 16);
+  }
 }
 
-export function createRenderer(canvas) {
-  const context = canvas.getContext('2d');
-  const view = { scale: 1, x: 0, y: 0 };
-  const camera = { x: 0, y: 0 };
-  const fonts = new Map();
+function drawEffects(ctx, state) {
+  for (const pt of state.particles) {
+    const s = toScreen(state, pt.x, pt.y, pt.z || 0);
+    ctx.globalAlpha = Math.max(0, pt.life / pt.max);
+    ctx.fillStyle = pt.color;
+    ctx.beginPath();
+    ctx.arc(s.x, s.y, pt.size, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.globalAlpha = 1;
+  }
+  // Muzzle flash lines.
+  for (const t of state.tracers) {
+    const a = toScreen(state, t.x0, t.y0, 0);
+    const b = toScreen(state, t.x1, t.y1, 0);
+    ctx.strokeStyle = '#ffe98a';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(a.x, a.y);
+    ctx.lineTo(b.x, b.y);
+    ctx.stroke();
+  }
+}
 
-  function resize() {
-    const ratio = window.devicePixelRatio || 1;
-    const width = Math.round(window.innerWidth * ratio);
-    const height = Math.round(window.innerHeight * ratio);
-    canvas.width = width;
-    canvas.height = height;
-    view.scale = Math.min(width / VIEW.width, height / VIEW.height);
-    view.x = (width - VIEW.width * view.scale) / 2;
-    view.y = (height - VIEW.height * view.scale) / 2;
+// ---- HUD ----
+function panel(ctx, x, y, w, h) {
+  ctx.fillStyle = PAL.hud;
+  ctx.fillRect(x, y, w, h);
+  ctx.strokeStyle = PAL.hudEdge;
+  ctx.lineWidth = 1;
+  ctx.strokeRect(x + 0.5, y + 0.5, w - 1, h - 1);
+}
+
+function bar(ctx, x, y, w, h, frac, color) {
+  ctx.fillStyle = 'rgba(255,255,255,0.15)';
+  ctx.fillRect(x, y, w, h);
+  ctx.fillStyle = color;
+  ctx.fillRect(x, y, Math.max(0, Math.min(1, frac)) * w, h);
+}
+
+function drawHud(ctx, state) {
+  const W = CFG.canvasW;
+  const H = CFG.canvasH;
+  const p = state.player;
+  const mission = missionAt(state.missionIndex);
+  const stage = stageAt(mission, state.stageIndex);
+  const district = districtAt(p.x, p.y);
+  const rr = respectRank(state.respect);
+  ctx.textBaseline = 'top';
+
+  // Top-left: mission tracker.
+  panel(ctx, 12, 12, 330, 92);
+  ctx.fillStyle = PAL.hudEdge;
+  ctx.font = 'bold 14px sans-serif';
+  ctx.fillText('JOB ' + mission.id + '/' + 10 + ' · ' + mission.title, 22, 20);
+  ctx.fillStyle = '#fff';
+  ctx.font = '12px sans-serif';
+  ctx.fillText('STAGE ' + (state.stageIndex + 1) + '/' + mission.stages.length, 22, 42);
+  ctx.fillStyle = '#ffd98a';
+  ctx.fillText('NEXT: ' + nextObjective(mission, state.stageIndex), 22, 60, 310);
+  ctx.fillStyle = '#9fb4d8';
+  ctx.font = '11px sans-serif';
+  ctx.fillText(mission.brief, 22, 82, 310);
+
+  // Top-centre: district, standing, respect.
+  panel(ctx, W / 2 - 170, 12, 340, 56);
+  ctx.fillStyle = '#fff';
+  ctx.font = 'bold 13px sans-serif';
+  ctx.fillText(district.name + ' · ' + state.standing, W / 2 - 160, 20);
+  ctx.fillStyle = PAL.hudEdge;
+  ctx.font = '12px sans-serif';
+  ctx.fillText('RESPECT: ' + rr.rank.name + ' ' + state.respect + (rr.next ? '/' + rr.next.at : ' MAX'), W / 2 - 160, 42);
+
+  // Top-right: money, wanted stars, air unit.
+  panel(ctx, W - 252, 12, 240, state.police.heli.active ? 92 : 72);
+  ctx.fillStyle = '#7ddc7d';
+  ctx.font = 'bold 18px sans-serif';
+  ctx.fillText('$' + state.money.toLocaleString('en-US'), W - 242, 20);
+  ctx.font = '20px sans-serif';
+  let stars = '';
+  for (let i = 0; i < 5; i++) stars += i < state.police.wanted ? '★' : '☆';
+  ctx.fillStyle = PAL.star;
+  ctx.fillText(stars, W - 242, 46);
+  if (state.police.heli.active) {
+    ctx.fillStyle = '#ff5a4e';
+    ctx.font = 'bold 12px sans-serif';
+    ctx.fillText('AIR UNIT DEPLOYED', W - 242, 72);
   }
 
-  function text(value, x, y, size, color, align) {
-    const key = `${size}`;
-    if (!fonts.has(key)) fonts.set(key, `${size}px ${FONT}`);
-    context.font = fonts.get(key);
-    context.fillStyle = color;
-    context.textAlign = align;
-    context.fillText(value, x, y);
+  // Left-mid: SOLMAR PD dispatch board, six named units.
+  const rows = state.police.dispatchRows(p);
+  panel(ctx, 12, 150, 300, 30 + rows.length * 20);
+  ctx.fillStyle = PAL.hudEdge;
+  ctx.font = 'bold 12px sans-serif';
+  ctx.fillText('SOLMAR PD DISPATCH', 22, 158);
+  ctx.font = '11px monospace';
+  rows.forEach((r, i) => {
+    ctx.fillStyle = i < state.police.wanted + 1 ? '#fff' : '#8a93a8';
+    ctx.fillText(r.call + ' ' + r.role + ' ' + r.dist + 'm ' + r.tactic, 22, 180 + i * 20);
+  });
+
+  // Right-mid: crew ability cards.
+  panel(ctx, W - 252, 150, 240, 118);
+  ctx.fillStyle = PAL.hudEdge;
+  ctx.font = 'bold 12px sans-serif';
+  ctx.fillText('CREW — press 1/2/3', W - 242, 158);
+  CREW.forEach((c, i) => {
+    const cd = Math.max(0, state.crewCooldown[c.id] || 0);
+    const y = 178 + i * 30;
+    ctx.fillStyle = c.color;
+    ctx.fillRect(W - 242, y, 10, 10);
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 11px sans-serif';
+    ctx.fillText(c.name + ' · ' + c.role, W - 228, y - 1);
+    ctx.fillStyle = '#c8d0e0';
+    ctx.font = '10px sans-serif';
+    ctx.fillText(c.ability + ' — ' + c.desc + (cd > 0 ? ' (' + Math.ceil(cd) + 's)' : ' READY'), W - 228, y + 11);
+  });
+
+  // Bottom-left: circular minimap.
+  const mx = 92;
+  const my = H - 92;
+  const mr = 72;
+  ctx.save();
+  ctx.beginPath();
+  ctx.arc(mx, my, mr, 0, Math.PI * 2);
+  ctx.clip();
+  ctx.fillStyle = '#22304a';
+  ctx.fillRect(mx - mr, my - mr, mr * 2, mr * 2);
+  const scale = (mr * 2) / CFG.worldW;
+  ctx.fillStyle = PAL.road;
+  for (let gx = 0; gx <= CFG.worldW; gx += CFG.roadGap) {
+    ctx.fillRect(mx - mr + gx * scale, my - mr, 3, mr * 2);
+    ctx.fillRect(mx - mr, my - mr + gx * scale, mr * 2, 3);
+  }
+  ctx.fillStyle = PAL.sea;
+  ctx.fillRect(mx - mr, my - mr, 8, mr * 2);
+  for (const c of state.police.cruisers) {
+    ctx.fillStyle = '#ff5a4e';
+    ctx.fillRect(mx - mr + c.x * scale - 2, my - mr + c.y * scale - 2, 4, 4);
+  }
+  if (stage && stage.x !== undefined) {
+    ctx.fillStyle = PAL.hudEdge;
+    ctx.beginPath();
+    ctx.arc(mx - mr + stage.x * scale, my - mr + stage.y * scale, 5, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.fillStyle = '#fff';
+  ctx.beginPath();
+  ctx.arc(mx - mr + p.x * scale, my - mr + p.y * scale, 4, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.restore();
+  ctx.strokeStyle = PAL.hudEdge;
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.arc(mx, my, mr, 0, Math.PI * 2);
+  ctx.stroke();
+  ctx.fillStyle = '#fff';
+  ctx.font = 'bold 10px sans-serif';
+  ctx.fillText('SOLMAR', mx - 22, my + mr + 6);
+
+  // Bottom-centre: weapon slots strip + radio line.
+  const slotW = 58;
+  const slotsX = W / 2 - (WEAPONS.length * slotW) / 2;
+  const slotsY = H - 64;
+  WEAPONS.forEach((w, i) => {
+    const x = slotsX + i * slotW;
+    const selected = state.weapon === i;
+    ctx.fillStyle = selected ? 'rgba(247,183,51,0.85)' : PAL.hud;
+    ctx.fillRect(x, slotsY, slotW - 4, 34);
+    ctx.strokeStyle = selected ? '#fff' : '#5a6378';
+    ctx.strokeRect(x + 0.5, slotsY + 0.5, slotW - 5, 33);
+    ctx.fillStyle = w.locked ? '#8a93a8' : '#fff';
+    ctx.font = 'bold 10px sans-serif';
+    ctx.fillText(w.locked ? 'LOCKED' : w.name, x + 5, slotsY + 8);
+    ctx.fillStyle = '#c8d0e0';
+    ctx.font = '9px sans-serif';
+    ctx.fillText(w.owned ? 'OWNED' : 'SHOP', x + 5, slotsY + 21);
+  });
+  ctx.fillStyle = '#fff';
+  ctx.font = '12px sans-serif';
+  ctx.textAlign = 'center';
+  ctx.fillText('RADIO: ' + state.radio.shortLine() + '  [R to change]', W / 2, H - 24);
+  ctx.textAlign = 'left';
+
+  // Bottom-right: speed, car, condition, health, armour.
+  panel(ctx, W - 252, H - 118, 240, 106);
+  ctx.fillStyle = '#fff';
+  ctx.font = 'bold 22px sans-serif';
+  ctx.fillText(Math.round(Math.abs(p.speed || 0) * 2.2) + ' km/h', W - 242, H - 110);
+  ctx.font = '12px sans-serif';
+  ctx.fillStyle = '#ffd98a';
+  ctx.fillText(p.inCar && p.car ? p.car.name : 'ON FOOT', W - 242, H - 82);
+  if (p.inCar && p.car) {
+    const cond = Math.round(p.car.condition);
+    ctx.fillStyle = cond > 50 ? '#7ddc7d' : '#ff5a4e';
+    ctx.fillText('CONDITION ' + cond + '%', W - 242, H - 64);
+    bar(ctx, W - 242, H - 48, 220, 6, cond / 100, cond > 50 ? '#7ddc7d' : '#ff5a4e');
+  }
+  ctx.fillStyle = '#fff';
+  ctx.font = '11px sans-serif';
+  ctx.fillText('HEALTH', W - 242, H - 34);
+  bar(ctx, W - 182, H - 34, 160, 8, p.hp / 100, '#7ddc7d');
+  ctx.fillText('ARMOUR', W - 242, H - 20);
+  bar(ctx, W - 182, H - 20, 160, 8, p.armour / 100, '#7ab8ff');
+
+  // Dialogue box with portrait.
+  if (state.dialogue) {
+    const dx = W / 2 - 260;
+    const dy = H - 168;
+    panel(ctx, dx, dy, 520, 92);
+    ctx.fillStyle = state.dialogue.color || PAL.hudEdge;
+    ctx.beginPath();
+    ctx.arc(dx + 42, dy + 46, 30, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = '#222';
+    ctx.font = 'bold 22px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText((state.dialogue.name || 'C')[0], dx + 42, dy + 38);
+    ctx.textAlign = 'left';
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 13px sans-serif';
+    ctx.fillText(state.dialogue.name + ' — ' + (state.dialogue.role || ''), dx + 86, dy + 14);
+    ctx.fillStyle = '#e8ecf4';
+    ctx.font = '13px sans-serif';
+    wrapText(ctx, state.dialogue.text, dx + 86, dy + 36, 420, 17);
   }
 
-  // World-space text, drawn undistorted: the vertical squash is undone for glyphs.
-  function worldText(value, x, y, size, color, align) {
-    context.save();
-    context.translate(x, y);
-    context.scale(1, 1 / SQ);
-    const key = `w${size}`;
-    if (!fonts.has(key)) fonts.set(key, `${size}px ${FONT}`);
-    context.font = fonts.get(key);
-    context.fillStyle = color;
-    context.textAlign = align || 'center';
-    context.textBaseline = 'middle';
-    context.fillText(value, 0, 0);
-    context.restore();
-    context.textBaseline = 'alphabetic';
+  // Toast line under the district panel.
+  if (state.toast) {
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 14px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText(state.toast, W / 2, 82);
+    ctx.textAlign = 'left';
   }
 
-  function roundRect(x, y, w, h, r) {
-    context.beginPath();
-    context.moveTo(x + r, y);
-    context.arcTo(x + w, y, x + w, y + h, r);
-    context.arcTo(x + w, y + h, x, y + h, r);
-    context.arcTo(x, y + h, x, y, r);
-    context.arcTo(x, y, x + w, y, r);
-    context.closePath();
+  // Controls hint, bottom edge left of minimap.
+  ctx.fillStyle = 'rgba(255,255,255,0.75)';
+  ctx.font = '11px sans-serif';
+  ctx.fillText('WASD drive/walk · E enter car · F fire · R radio · G garage · Q race · 1/2/3 crew · P pause', 180, H - 8);
+}
+
+function wrapText(ctx, text, x, y, maxW, lh) {
+  const words = text.split(' ');
+  let line = '';
+  let yy = y;
+  for (const w of words) {
+    const test = line ? line + ' ' + w : w;
+    if (ctx.measureText(test).width > maxW) {
+      ctx.fillText(line, x, yy);
+      line = w;
+      yy += lh;
+    } else line = test;
   }
+  if (line) ctx.fillText(line, x, yy);
+}
 
-  // The golden-hour sky: gradient, low sun, clouds, a distant skyline on the horizon.
-  function drawSky() {
-    const grad = context.createLinearGradient(0, 0, 0, SKY_H);
-    grad.addColorStop(0, '#ff7a3c');
-    grad.addColorStop(0.55, '#ffb347');
-    grad.addColorStop(1, '#ffe3a3');
-    context.fillStyle = grad;
-    context.fillRect(0, 0, VIEW.width, SKY_H);
-    // The sun, low over the bay, with a glow around it.
-    const halo = context.createRadialGradient(1005, 52, 4, 1005, 52, 70);
-    halo.addColorStop(0, 'rgba(255, 246, 200, 0.95)');
-    halo.addColorStop(1, 'rgba(255, 246, 200, 0)');
-    context.fillStyle = halo;
-    context.fillRect(935, -18, 140, 140);
-    context.fillStyle = '#fff3c4';
-    context.beginPath();
-    context.arc(1005, 52, 24, 0, Math.PI * 2);
-    context.fill();
-    // Clouds drifting across the sunset.
-    context.fillStyle = 'rgba(255, 255, 255, 0.5)';
-    const clouds = [[180, 36, 70, 10], [420, 62, 90, 12], [700, 28, 60, 9], [1150, 30, 66, 10], [60, 74, 56, 9]];
-    for (const [cx, cy, rx, ry] of clouds) {
-      context.beginPath();
-      context.ellipse(cx, cy, rx, ry, 0, 0, Math.PI * 2);
-      context.fill();
-    }
-    // The far skyline, dark against the sunset, windows lit.
-    for (let i = 0; i < 24; i += 1) {
-      const h = hash(i * 53, 7);
-      const w = 30 + (h % 22);
-      const bh = 18 + (h % 46);
-      const x = i * 54 + ((h >> 5) % 12);
-      context.fillStyle = 'rgba(90, 61, 110, 0.85)';
-      context.fillRect(x, SKY_H - bh, w, bh);
-      context.fillStyle = 'rgba(255, 210, 63, 0.8)';
-      for (let wy = SKY_H - bh + 6; wy < SKY_H - 4; wy += 12) {
-        if ((h >> ((wy / 12) % 24)) & 1) context.fillRect(x + 6 + ((h >> 3) % Math.max(1, w - 12)), wy, 3, 4);
-      }
-    }
-    context.fillStyle = 'rgba(90, 61, 110, 0.9)';
-    context.fillRect(0, SKY_H - 2, VIEW.width, 2);
-  }
+function drawBanner(ctx, state) {
+  const W = CFG.canvasW;
+  ctx.fillStyle = 'rgba(12,14,22,0.85)';
+  ctx.fillRect(W / 2 - 260, 120, 520, 64);
+  ctx.strokeStyle = PAL.hudEdge;
+  ctx.strokeRect(W / 2 - 260, 120, 520, 64);
+  ctx.fillStyle = PAL.hudEdge;
+  ctx.font = 'bold 20px sans-serif';
+  ctx.textAlign = 'center';
+  ctx.fillText(state.banner, W / 2, 138);
+  ctx.textAlign = 'left';
+}
 
-  function drawCity(state) {
-    // Ground: grass, then sand and sea along the south edge.
-    context.fillStyle = PALETTE.grass;
-    context.fillRect(0, 0, WORLD.width, WORLD.height);
-    context.fillStyle = PALETTE.sand;
-    context.fillRect(0, WORLD.beachY, WORLD.width, WORLD.height - WORLD.beachY);
-    context.fillStyle = PALETTE.sea;
-    context.fillRect(0, WORLD.seaY, WORLD.width, WORLD.height - WORLD.seaY);
-    context.fillStyle = '#7fb3d5';
-    context.fillRect(0, WORLD.seaY, WORLD.width, 6);
-    // The pier: planks running out into the sea at the south end.
-    context.fillStyle = '#8a6f4d';
-    context.fillRect(1900, 2320, 40, 130);
-    context.fillStyle = '#a8875f';
-    for (let y = 2320; y < 2450; y += 12) context.fillRect(1892, y, 56, 6);
+function drawPaused(ctx) {
+  ctx.fillStyle = 'rgba(10,10,16,0.6)';
+  ctx.fillRect(0, 0, CFG.canvasW, CFG.canvasH);
+  ctx.fillStyle = '#fff';
+  ctx.font = 'bold 34px sans-serif';
+  ctx.textAlign = 'center';
+  ctx.fillText('PAUSED', CFG.canvasW / 2, CFG.canvasH / 2 - 10);
+  ctx.font = '15px sans-serif';
+  ctx.fillText('Press P to keep playing', CFG.canvasW / 2, CFG.canvasH / 2 + 24);
+  ctx.textAlign = 'left';
+}
 
-    // Roads: asphalt with a dashed centre line and sidewalks along the edges.
-    for (let x = 160; x < WORLD.width; x += WORLD.roadGap) {
-      context.fillStyle = PALETTE.sidewalk;
-      context.fillRect(x - WORLD.roadWidth / 2 - WORLD.sidewalk, 0, WORLD.roadWidth + WORLD.sidewalk * 2, WORLD.height);
-      context.fillStyle = PALETTE.road;
-      context.fillRect(x - WORLD.roadWidth / 2, 0, WORLD.roadWidth, WORLD.height);
-      context.fillStyle = PALETTE.roadLine;
-      for (let y = 0; y < WORLD.height; y += 48) context.fillRect(x - 2, y, 4, 24);
-    }
-    for (let y = 160; y < WORLD.height; y += WORLD.roadGap) {
-      context.fillStyle = PALETTE.sidewalk;
-      context.fillRect(0, y - WORLD.roadWidth / 2 - WORLD.sidewalk, WORLD.width, WORLD.roadWidth + WORLD.sidewalk * 2);
-      context.fillStyle = PALETTE.road;
-      context.fillRect(0, y - WORLD.roadWidth / 2, WORLD.width, WORLD.roadWidth);
-      context.fillStyle = PALETTE.roadLine;
-      for (let x = 0; x < WORLD.width; x += 48) context.fillRect(x, y - 2, 24, 4);
-    }
-
-    // The park: green lawn with trees.
-    for (const park of state.parks) {
-      context.fillStyle = PALETTE.park;
-      context.fillRect(park.x, park.y, park.w, park.h);
-      const h = hash(park.x, park.y);
-      for (let i = 0; i < 9; i += 1) {
-        const tx = park.x + 20 + ((h >> (i * 3)) % 100) / 100 * (park.w - 40);
-        const ty = park.y + 20 + ((h >> (i * 5 + 1)) % 100) / 100 * (park.h - 40);
-        context.fillStyle = '#2f5230';
-        context.beginPath();
-        context.arc(tx, ty, 14, 0, Math.PI * 2);
-        context.fill();
-      }
-    }
-
-    // Named places: Milo's garage and the Marina safehouse.
-    const places = state.places;
-    context.fillStyle = '#e5534b';
-    context.fillRect(places.GARAGE.x - 40, places.GARAGE.y - 26, 80, 52);
-    worldText('GARAGE', places.GARAGE.x, places.GARAGE.y, 15, PALETTE.text);
-    context.fillStyle = '#3f6fd8';
-    context.fillRect(places.SAFEHOUSE.x - 44, places.SAFEHOUSE.y - 26, 88, 52);
-    worldText('SAFEHOUSE', places.SAFEHOUSE.x, places.SAFEHOUSE.y, 15, PALETTE.text);
-  }
-
-  // A single building as a 3D block: long sunset shadow, south face, east
-  // face, roof with rooftop boxes, lit windows on the south face.
-  function drawBuilding(b) {
-    const h = hash(Math.round(b.x), Math.round(b.y));
-    const tall = 46 + (h % 64);
-    // Long shadow, thrown west by the low sun.
-    context.fillStyle = 'rgba(20, 10, 0, 0.28)';
-    context.fillRect(b.x - 26, b.y + 10, b.w, b.h);
-    // East face, darker.
-    context.fillStyle = shade(b.color, 0.62);
-    context.beginPath();
-    context.moveTo(b.x + b.w, b.y);
-    context.lineTo(b.x + b.w + ROOF_SHIFT, b.y - tall);
-    context.lineTo(b.x + b.w + ROOF_SHIFT, b.y + b.h - tall);
-    context.lineTo(b.x + b.w, b.y + b.h);
-    context.closePath();
-    context.fill();
-    // South face, with lit windows.
-    context.fillStyle = b.color;
-    context.beginPath();
-    context.moveTo(b.x, b.y + b.h);
-    context.lineTo(b.x + b.w, b.y + b.h);
-    context.lineTo(b.x + b.w + ROOF_SHIFT, b.y + b.h - tall);
-    context.lineTo(b.x + ROOF_SHIFT, b.y + b.h - tall);
-    context.closePath();
-    context.fill();
-    context.fillStyle = '#ffd23f';
-    const cols = Math.max(1, Math.floor(b.w / 26));
-    const rows = Math.max(1, Math.floor((tall - 16) / 24));
-    for (let cx = 0; cx < cols; cx += 1) {
-      for (let cy = 0; cy < rows; cy += 1) {
-        if ((h >> ((cx * 3 + cy * 7) % 24)) & 1) {
-          context.fillRect(b.x + 12 + cx * 26, b.y + b.h - tall + 8 + cy * 24, 10, 10);
-        }
-      }
-    }
-    // Roof, shifted up and east, with a darker core and rooftop boxes.
-    context.fillStyle = '#4b5160';
-    context.fillRect(b.x + ROOF_SHIFT, b.y - tall, b.w, b.h);
-    context.fillStyle = PALETTE.buildingRoof;
-    context.fillRect(b.x + ROOF_SHIFT + 8, b.y - tall + 8, b.w - 16, b.h - 16);
-    context.fillStyle = '#6b7280';
-    context.fillRect(b.x + ROOF_SHIFT + 14, b.y - tall + 14, 18, 14);
-    if (b.w > 90) context.fillRect(b.x + ROOF_SHIFT + b.w - 40, b.y - tall + b.h - 34, 20, 16);
-  }
-
-  function drawCarShape(x, y, angle, length, width, body, outline, isPlayer, damage, time) {
-    // Long shadow on the asphalt.
-    context.fillStyle = 'rgba(0, 0, 0, 0.3)';
-    context.beginPath();
-    context.ellipse(x + 8, y + 10, length * 0.55, width * 0.55, 0, 0, Math.PI * 2);
-    context.fill();
-    // A wrecked car smokes from under the hood.
-    if (damage > 50) {
-      const wobble = Math.sin(time * 6 + x) * 4;
-      context.fillStyle = 'rgba(140, 140, 140, 0.35)';
-      context.beginPath();
-      context.arc(x - Math.cos(angle) * length * 0.7 + wobble, y - Math.sin(angle) * length * 0.7, 9, 0, Math.PI * 2);
-      context.fill();
-      context.beginPath();
-      context.arc(x - Math.cos(angle) * length * 0.85, y - Math.sin(angle) * length * 0.85 - 6, 6, 0, Math.PI * 2);
-      context.fill();
-    }
-    // The player's car gets a pulsing gold ring, so the eye finds it at once.
-    if (isPlayer) {
-      context.strokeStyle = `rgba(242, 201, 76, ${0.5 + 0.3 * Math.sin(time * 4)})`;
-      context.lineWidth = 3;
-      context.beginPath();
-      context.ellipse(x, y, length * 0.72, width * 0.95, 0, 0, Math.PI * 2);
-      context.stroke();
-    }
-    context.save();
-    context.translate(x, y);
-    context.rotate(angle);
-    context.fillStyle = outline || '#11141b';
-    roundRect(-length / 2 - 2, -width / 2 - 2, length + 4, width + 4, 8);
-    context.fill();
-    context.fillStyle = body;
-    roundRect(-length / 2, -width / 2, length, width, 6);
-    context.fill();
-    // Windshield and rear window.
-    context.fillStyle = '#1b2a3a';
-    context.fillRect(length * 0.08, -width / 2 + 3, length * 0.16, width - 6);
-    context.fillRect(-length * 0.32, -width / 2 + 3, length * 0.12, width - 6);
-    // Headlights.
-    context.fillStyle = '#ffe9a3';
-    context.fillRect(length / 2 - 3, -width / 2 + 3, 3, 5);
-    context.fillRect(length / 2 - 3, width / 2 - 8, 3, 5);
-    context.restore();
-    // Roof, shifted up-screen so the car reads as a solid body, not a flat card.
-    context.save();
-    context.translate(x, y - 9);
-    context.rotate(angle);
-    context.fillStyle = shade(body, 1.28);
-    roundRect(-length * 0.28, -width * 0.32, length * 0.56, width * 0.64, 5);
-    context.fill();
-    context.fillStyle = '#1b2a3a';
-    context.fillRect(length * 0.12, -width * 0.32 + 2, length * 0.12, width * 0.64 - 4);
-    context.restore();
-    // Cop light bar, flashing red and blue.
-    if (body === '#3f6fd8') {
-      context.save();
-      context.translate(x, y);
-      context.rotate(angle);
-      context.fillStyle = Math.floor(time * 4) % 2 === 0 ? '#ff4b4b' : '#4b7dff';
-      context.fillRect(-4, -width / 2 - 2, 8, 5);
-      context.restore();
+function drawTitle(ctx, state) {
+  const W = CFG.canvasW;
+  const H = CFG.canvasH;
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, '#1c2450');
+  g.addColorStop(0.5, '#c65a2e');
+  g.addColorStop(1, '#f7b733');
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, W, H);
+  ctx.fillStyle = 'rgba(20,16,40,0.55)';
+  ctx.fillRect(0, H - 190, W, 190);
+  ctx.fillStyle = '#fff';
+  ctx.font = 'bold 74px sans-serif';
+  ctx.textAlign = 'center';
+  ctx.fillText('SOLMAR HEAT', W / 2, 150);
+  ctx.fillStyle = PAL.hudEdge;
+  ctx.font = 'bold 19px sans-serif';
+  ctx.fillText('10 STORY JOBS · CREW OF 3 · SAVES · RADIO · RACES · GARAGE · 5-STAR PD CHASE', W / 2, 190);
+  ctx.fillStyle = '#ffe9b0';
+  ctx.font = '15px sans-serif';
+  ctx.fillText('A sun-soaked open-world crime game in the fictional coastal city of Solmar.', W / 2, 224);
+  ctx.fillText('Fixer Cassia Voss has ten jobs for you. The Solmar PD has other plans.', W / 2, 248);
+  // Save slots.
+  const slots = state.slots || [];
+  for (let i = 0; i < 3; i++) {
+    const x = W / 2 - 330 + i * 226;
+    panel(ctx, x, 300, 210, 96);
+    ctx.fillStyle = PAL.hudEdge;
+    ctx.font = 'bold 13px sans-serif';
+    ctx.textAlign = 'left';
+    ctx.fillText('SAVE SLOT ' + (i + 1), x + 12, 312);
+    const s = slots[i];
+    ctx.fillStyle = '#fff';
+    ctx.font = '12px sans-serif';
+    if (s) {
+      ctx.fillText('$' + s.money.toLocaleString('en-US'), x + 12, 336);
+      ctx.fillText('Job ' + (s.missionIndex + 1) + ' of 10', x + 12, 356);
+      ctx.fillText('Respect ' + s.respect, x + 12, 376);
+    } else {
+      ctx.fillText('— EMPTY —', x + 12, 336);
+      ctx.fillText('A fresh start in Solmar.', x + 12, 356);
     }
   }
-
-  function drawPickups(state) {
-    for (const pk of state.pickups) {
-      if (!pk.active) continue;
-      const bob = Math.sin(state.time * 4 + pk.x) * 3;
-      if (pk.kind === 'crew') {
-        const member = CREW[pk.crewIndex];
-        context.fillStyle = '#2dd4bf';
-        context.beginPath();
-        context.arc(pk.x, pk.y + bob, 16, 0, Math.PI * 2);
-        context.fill();
-        context.strokeStyle = '#0d0f14';
-        context.lineWidth = 3;
-        context.beginPath();
-        context.arc(pk.x, pk.y + bob, 16, 0, Math.PI * 2);
-        context.stroke();
-        worldText(member ? member.name[0] : '?', pk.x, pk.y + bob, 16, '#0d0f14');
-        worldText(member ? member.name : 'CREW', pk.x, pk.y + bob + 30, 12, '#2dd4bf');
-        continue;
-      }
-      context.fillStyle = pk.kind === 'drop' ? PALETTE.cash : '#f2c94c';
-      context.beginPath();
-      context.arc(pk.x, pk.y + bob, 13, 0, Math.PI * 2);
-      context.fill();
-      worldText('$', pk.x, pk.y + bob, 16, '#0d0f14');
-    }
+  ctx.fillStyle = '#fff';
+  ctx.font = 'bold 22px sans-serif';
+  ctx.textAlign = 'center';
+  ctx.fillText(state.slots && state.slots.some(Boolean) ? 'PRESS ENTER — CONTINUE  ·  N — NEW GAME' : 'PRESS ENTER — NEW GAME', W / 2, 440);
+  ctx.font = '14px sans-serif';
+  ctx.fillStyle = '#ffe9b0';
+  ctx.fillText('WASD move / drive · E steal & enter cars · F fire · R radio · G garage · Q street race · 1/2/3 crew abilities · P pause', W / 2, 480);
+  ctx.fillText('Saves live in your browser (localStorage). Money, respect and district standing carry across jobs.', W / 2, 506);
+  ctx.textAlign = 'left';
+  // Mini skyline along the bottom.
+  ctx.fillStyle = 'rgba(30,20,50,0.8)';
+  let x = 0;
+  let i = 0;
+  while (x < W) {
+    const bw = 40 + ((i * 41) % 70);
+    const bh = 50 + ((i * 29) % 80);
+    ctx.fillRect(x, H - bh, bw, bh);
+    x += bw + 6;
+    i++;
   }
-
-  function drawEntities(state) {
-    // Painter's algorithm: everything sorted by its south edge, so nearer
-    // things cover farther ones and the 3D blocks read as solid.
-    const items = [];
-    for (const b of state.buildings) items.push({ key: b.y + b.h, draw: () => drawBuilding(b) });
-    for (const car of state.cars) {
-      if (!car.active) continue;
-      const isPlayer = car === state.player.inCar;
-      items.push({
-        key: car.y,
-        draw: () => drawCarShape(car.x, car.y, car.angle, CAR.length, CAR.width, car.color, isPlayer ? PALETTE.player : '#11141b', isPlayer, car.damage || 0, state.time),
-      });
-    }
-    for (const ped of state.peds) {
-      if (!ped.active) continue;
-      items.push({
-        key: ped.y,
-        draw: () => {
-          context.fillStyle = 'rgba(0, 0, 0, 0.3)';
-          context.beginPath();
-          context.ellipse(ped.x + 3, ped.y + 5, 10, 5, 0, 0, Math.PI * 2);
-          context.fill();
-          if (ped.down) {
-            context.fillStyle = ped.color;
-            context.beginPath();
-            context.ellipse(ped.x, ped.y, 13, 6, ped.angle, 0, Math.PI * 2);
-            context.fill();
-            return;
-          }
-          context.fillStyle = ped.color;
-          context.beginPath();
-          context.arc(ped.x, ped.y, PED.radius, 0, Math.PI * 2);
-          context.fill();
-          context.fillStyle = '#11141b';
-          context.beginPath();
-          context.arc(ped.x + Math.cos(ped.angle) * 6, ped.y + Math.sin(ped.angle) * 6, 3, 0, Math.PI * 2);
-          context.fill();
-        },
-      });
-    }
-    for (const cop of state.cops) {
-      if (!cop.active || cop.inCar) continue; // the cop car is drawn with the cars
-      items.push({
-        key: cop.y,
-        draw: () => {
-          context.fillStyle = 'rgba(0, 0, 0, 0.3)';
-          context.beginPath();
-          context.ellipse(cop.x + 3, cop.y + 5, 11, 5, 0, 0, Math.PI * 2);
-          context.fill();
-          if (cop.down) {
-            context.fillStyle = '#3f6fd8';
-            context.beginPath();
-            context.ellipse(cop.x, cop.y, 14, 6, cop.angle, 0, Math.PI * 2);
-            context.fill();
-            return;
-          }
-          context.fillStyle = PALETTE.cop;
-          context.beginPath();
-          context.arc(cop.x, cop.y, 13, 0, Math.PI * 2);
-          context.fill();
-          context.fillStyle = '#fff';
-          context.fillRect(cop.x - 6, cop.y - 3, 12, 6);
-        },
-      });
-    }
-    const p = state.player;
-    if (p.onFoot) {
-      items.push({
-        key: p.y,
-        draw: () => {
-          context.fillStyle = 'rgba(0, 0, 0, 0.3)';
-          context.beginPath();
-          context.ellipse(p.x + 3, p.y + 5, 13, 6, 0, 0, Math.PI * 2);
-          context.fill();
-          context.strokeStyle = `rgba(242, 201, 76, ${0.5 + 0.3 * Math.sin(state.time * 4)})`;
-          context.lineWidth = 3;
-          context.beginPath();
-          context.ellipse(p.x, p.y, 20, 13, 0, 0, Math.PI * 2);
-          context.stroke();
-          context.fillStyle = PALETTE.player;
-          context.beginPath();
-          context.arc(p.x, p.y, PLAYER.radius, 0, Math.PI * 2);
-          context.fill();
-          context.fillStyle = '#11141b';
-          context.beginPath();
-          context.arc(p.x + Math.cos(p.angle) * 8, p.y + Math.sin(p.angle) * 8, 4, 0, Math.PI * 2);
-          context.fill();
-          if (p.punchCooldown > 0.25) {
-            context.fillStyle = PALETTE.player;
-            context.beginPath();
-            context.arc(p.x + Math.cos(p.angle) * 26, p.y + Math.sin(p.angle) * 26, 6, 0, Math.PI * 2);
-            context.fill();
-          }
-        },
-      });
-    }
-    items.sort((a, b) => a.key - b.key);
-    for (const item of items) item.draw();
-  }
-
-  function drawMarker(state) {
-    const t = state.missionTarget;
-    if (!t) return;
-    const pulse = 1 + Math.sin(state.time * 5) * 0.15;
-    context.save();
-    context.translate(t.x, t.y);
-    context.scale(pulse, pulse);
-    context.fillStyle = PALETTE.marker;
-    context.beginPath();
-    context.moveTo(0, -22);
-    context.lineTo(16, 0);
-    context.lineTo(0, 22);
-    context.lineTo(-16, 0);
-    context.closePath();
-    context.fill();
-    context.restore();
-    context.fillStyle = 'rgba(255, 95, 162, 0.25)';
-    context.beginPath();
-    context.arc(t.x, t.y, 34 + Math.sin(state.time * 5) * 6, 0, Math.PI * 2);
-    context.fill();
-  }
-
-  // CONDOR-1, the police helicopter: it circles the player with a searchlight.
-  function drawHeli(state) {
-    if (state.wanted < 3) return;
-    const p = state.player;
-    const heli = heliGroundPos(state);
-    // Searchlight cone down to the player, and the bright pool around them.
-    context.fillStyle = 'rgba(255, 230, 140, 0.16)';
-    context.beginPath();
-    context.moveTo(heli.x - 14, heli.y - 64);
-    context.lineTo(p.x - 24, p.y);
-    context.lineTo(p.x + 24, p.y);
-    context.closePath();
-    context.fill();
-    context.fillStyle = 'rgba(255, 230, 140, 0.22)';
-    context.beginPath();
-    context.arc(p.x, p.y, 30, 0, Math.PI * 2);
-    context.fill();
-    // Ground shadow.
-    context.fillStyle = 'rgba(0, 0, 0, 0.3)';
-    context.beginPath();
-    context.ellipse(heli.x, heli.y + 8, 30, 12, 0, 0, Math.PI * 2);
-    context.fill();
-    // Body, hovering 64 world units above its shadow.
-    const by = heli.y - 64;
-    context.fillStyle = '#3a4252';
-    context.beginPath();
-    context.ellipse(heli.x, by, 26, 11, 0, 0, Math.PI * 2);
-    context.fill();
-    context.fillStyle = '#9fd8ff';
-    context.beginPath();
-    context.ellipse(heli.x + 13, by - 2, 8, 6, 0, 0, Math.PI * 2);
-    context.fill();
-    context.strokeStyle = '#3a4252';
-    context.lineWidth = 5;
-    context.beginPath();
-    context.moveTo(heli.x - 24, by);
-    context.lineTo(heli.x - 52, by - 8);
-    context.stroke();
-    // Spinning rotor.
-    const rotor = state.time * 9;
-    context.strokeStyle = 'rgba(20, 24, 32, 0.85)';
-    context.lineWidth = 2;
-    context.beginPath();
-    context.moveTo(heli.x - Math.cos(rotor) * 40, by - 12 - Math.sin(rotor) * 4);
-    context.lineTo(heli.x + Math.cos(rotor) * 40, by - 12 + Math.sin(rotor) * 4);
-    context.stroke();
-    worldText('CONDOR-1', heli.x, by - 26, 12, PALETTE.star);
-  }
-
-  // Police dispatch: every active unit on the chase, named, with its
-  // distance in metres and what it is doing — read straight from the cops
-  // the world keeps.
-  function drawDispatch(state) {
-    const p = state.player;
-    const units = [];
-    for (let i = 0; i < state.cops.length; i += 1) {
-      const cop = state.cops[i];
-      if (!cop.active) continue;
-      const d = Math.hypot(cop.x - p.x, cop.y - p.y);
-      const metres = Math.max(1, Math.round(d * 0.06));
-      let tactic = 'PURSUIT';
-      if (cop.down) tactic = 'DOWN';
-      else if (cop.inCar) tactic = d < 150 ? 'RAMMING' : 'PURSUIT';
-      else tactic = cop.arrest > 0 ? 'HOLDING' : 'ON FOOT';
-      units.push({ name: DISPATCH_CALLSIGNS[i], metres, tactic });
-      if (units.length >= DISPATCH.maxRows) break;
-    }
-    if (state.wanted >= 3) units.push({ name: 'CONDOR-1', metres: 180, tactic: 'SEARCH' });
-    if (units.length === 0) return;
-    const height = DISPATCH.header + units.length * DISPATCH.row + DISPATCH.pad;
-    context.fillStyle = 'rgba(13, 15, 20, 0.78)';
-    context.fillRect(DISPATCH.x, DISPATCH.y, DISPATCH.width, height);
-    context.fillStyle = '#4b7dff';
-    context.fillRect(DISPATCH.x, DISPATCH.y, 4, height);
-    text('SOLMAR PD — DISPATCH', DISPATCH.x + 14, DISPATCH.y + 6, 14, '#8fb0ff', 'left');
-    for (let i = 0; i < units.length; i += 1) {
-      const u = units[i];
-      const y = DISPATCH.y + DISPATCH.header + i * DISPATCH.row;
-      text(u.name, DISPATCH.x + 14, y, 15, PALETTE.text, 'left');
-      text(`${u.metres} m`, DISPATCH.x + 158, y, 15, PALETTE.muted, 'left');
-      text(u.tactic, DISPATCH.x + DISPATCH.width - 12, y, 15, u.tactic === 'RAMMING' ? '#ff6b6b' : PALETTE.star, 'right');
-    }
-  }
-
-  // Mission tracker: which job of the story, its name, and the stage the
-  // player is on — the stage line comes from the world's mission index and stage.
-  function drawMissionTracker(state) {
-    const index = state.missionIndex;
-    const mission = MISSIONS[index];
-    let stage = (MISSION_STAGES[index] && MISSION_STAGES[index][state.missionStage]) || '';
-    if (index === 3 && state.missionStage === 0) {
-      let left = 0;
-      for (const pk of state.pickups) if (pk.active && pk.kind === 'drop') left += 1;
-      const t = Math.max(0, Math.ceil(state.missionTimer));
-      stage = `Grab the drops: ${left} left · ${Math.floor(t / 60)}:${String(t % 60).padStart(2, '0')} on the clock`;
-    }
-    if (index === 4) {
-      stage = `Crew: ${state.crew.length}/3 — find DANA · RICO · LENA`;
-    }
-    if (index === 5) {
-      const t = Math.max(0, Math.ceil(state.missionTimer));
-      stage = `Vault cash to the garage — ${Math.floor(t / 60)}:${String(t % 60).padStart(2, '0')} left, PD on your tail`;
-    }
-    if (index === 7 && state.missionStage === 0) {
-      let left = 0;
-      for (const pk of state.pickups) if (pk.active && pk.kind === 'drop') left += 1;
-      const t = Math.max(0, Math.ceil(state.missionTimer));
-      stage = `Grab the drops: ${left} left · ${Math.floor(t / 60)}:${String(t % 60).padStart(2, '0')} on the clock`;
-    }
-    const cx = VIEW.width / 2;
-    const y = TRACKER.top;
-    context.fillStyle = 'rgba(13, 15, 20, 0.72)';
-    context.fillRect(cx - TRACKER.width / 2, y, TRACKER.width, TRACKER.height);
-    text(`JOB ${index + 1}/${MISSIONS.length} · ${mission.name}`, cx, y + 8, 16, PALETTE.star, 'center');
-    if (stage) text(stage, cx, y + 30, 15, PALETTE.text, 'center');
-  }
-
-  // Milo's dialogue box, with his portrait: the story speaks while you drive.
-  function drawDialogue(state) {
-    if (!state.dialogue || state.dialogueT <= 0) return;
-    const d = state.dialogue;
-    const x = (VIEW.width - DIALOGUE.width) / 2;
-    const y = DIALOGUE.top;
-    context.fillStyle = 'rgba(13, 15, 20, 0.82)';
-    context.fillRect(x, y, DIALOGUE.width, DIALOGUE.height);
-    context.fillStyle = PALETTE.star;
-    context.fillRect(x, y, 4, DIALOGUE.height);
-    // Milo: face, flat cap, eyes, smile.
-    const px = x + 34;
-    const py = y + DIALOGUE.height / 2;
-    context.fillStyle = '#e8b98a';
-    context.beginPath();
-    context.arc(px, py, 19, 0, Math.PI * 2);
-    context.fill();
-    context.fillStyle = '#a33a3a';
-    context.beginPath();
-    context.arc(px, py - 4, 19, Math.PI, 0);
-    context.fill();
-    context.fillRect(px - 19, py - 6, 38, 5);
-    context.fillStyle = '#11141b';
-    context.beginPath();
-    context.arc(px - 7, py + 2, 2.5, 0, Math.PI * 2);
-    context.arc(px + 7, py + 2, 2.5, 0, Math.PI * 2);
-    context.fill();
-    context.strokeStyle = '#11141b';
-    context.lineWidth = 2;
-    context.beginPath();
-    context.arc(px, py + 7, 6, 0.15 * Math.PI, 0.85 * Math.PI);
-    context.stroke();
-    // The line, wrapped to two rows.
-    const words = d.text.split(' ');
-    const lines = ['', ''];
-    let li = 0;
-    context.font = `15px ${FONT}`;
-    for (const word of words) {
-      const trial = lines[li] ? `${lines[li]} ${word}` : word;
-      if (context.measureText(trial).width > 470 && lines[li]) {
-        li += 1;
-        if (li > 1) break;
-        lines[li] = word;
-      } else lines[li] = trial;
-    }
-    const tx = x + 64;
-    const speaker = `${d.speaker}: `;
-    context.font = `15px ${FONT}`;
-    const sw = context.measureText(speaker).width;
-    text(speaker, tx, y + 12, 15, PALETTE.star, 'left');
-    text(lines[0], tx + sw, y + 12, 15, PALETTE.text, 'left');
-    if (lines[1]) text(lines[1], tx, y + 32, 15, PALETTE.text, 'left');
-  }
-
-  // The crew cards: who rides with you, their role and their perk.
-  function drawCrewCards(state) {
-    for (let i = 0; i < CREW.length; i += 1) {
-      const member = CREW[i];
-      const recruited = state.crew.indexOf(member.name) !== -1;
-      const x = 16 + i * (CREW_CARD.width + CREW_CARD.gap);
-      const y = CREW_CARD.y;
-      context.fillStyle = recruited ? 'rgba(13, 15, 20, 0.78)' : 'rgba(13, 15, 20, 0.45)';
-      context.fillRect(x, y, CREW_CARD.width, CREW_CARD.height);
-      context.strokeStyle = recruited ? PALETTE.star : '#3a3f4a';
-      context.lineWidth = recruited ? 2 : 1;
-      context.strokeRect(x, y, CREW_CARD.width, CREW_CARD.height);
-      text(`${member.name} · ${member.role}`, x + 10, y + 8, 13, recruited ? PALETTE.text : PALETTE.muted, 'left');
-      text(recruited ? member.perk : 'NOT RECRUITED', x + 10, y + 28, 11, recruited ? '#7ee2a8' : PALETTE.muted, 'left');
-    }
-  }
-
-  // Radio: the station on air and the show, with the key that changes it.
-  function drawRadio(extra) {
-    const station = (extra && extra.station) || 'SOLMAR FM 88.5 — SUNSET DRIVE';
-    const parts = station.split(' — ');
-    const x = VIEW.width - RADIO_PANEL.width - MINI.margin;
-    const y = VIEW.height - MINI.height - MINI.margin - WEAPON_STRIP.gap - WEAPON_STRIP.height - 6 - RADIO_PANEL.height;
-    context.fillStyle = 'rgba(13, 15, 20, 0.78)';
-    context.fillRect(x, y, RADIO_PANEL.width, RADIO_PANEL.height);
-    text(`RADIO · ${parts[0] || station}`, x + 10, y + 6, 13, PALETTE.text, 'left');
-    text(`${parts[1] || ''} · R = change station`, x + 10, y + 24, 11, PALETTE.muted, 'left');
-  }
-
-  // Weapon strip: the player's fists and whether the next punch is ready,
-  // from the punch cooldown the world already tracks — plus what is being carried.
-  function drawWeaponStrip(state) {
-    const p = state.player;
-    const w = WEAPON_STRIP.width;
-    const x = VIEW.width - w - MINI.margin;
-    const y = VIEW.height - MINI.height - MINI.margin - WEAPON_STRIP.gap - WEAPON_STRIP.height;
-    const ready = p.punchCooldown <= 0;
-    const frac = Math.max(0, Math.min(1, 1 - p.punchCooldown / PLAYER.punchCooldown));
-    context.fillStyle = 'rgba(13, 15, 20, 0.78)';
-    context.fillRect(x, y, w, WEAPON_STRIP.height);
-    text(`WEAPON · ${WEAPON.key}`, x + 12, y + 6, 12, PALETTE.muted, 'left');
-    text(WEAPON.name, x + 12, y + 20, 17, PALETTE.text, 'left');
-    text(ready ? 'READY' : 'COOLING', x + w - 12, y + 6, 12, ready ? PALETTE.health : PALETTE.muted, 'right');
-    // Inventory: the package, or the drops collected on a drops job.
-    let carry = null;
-    if (state.carrying) carry = `CARRYING: ${state.carrying}`;
-    else if ((state.missionIndex === 3 || state.missionIndex === 7) && state.missionStage === 0) {
-      let total = 0;
-      let left = 0;
-      for (const pk of state.pickups) {
-        if (pk.kind === 'drop') {
-          total += 1;
-          if (pk.active) left += 1;
-        }
-      }
-      if (total > 0) carry = `DROPS ${total - left}/${total}`;
-    }
-    if (carry) text(carry, x + w - 12, y + 20, 12, PALETTE.star, 'right');
-    const bw = w - 24;
-    context.fillStyle = '#11141b';
-    context.fillRect(x + 12, y + WEAPON_STRIP.height - 8, bw, 6);
-    context.fillStyle = ready ? PALETTE.health : PALETTE.star;
-    context.fillRect(x + 12, y + WEAPON_STRIP.height - 8, bw * frac, 6);
-  }
-
-  function drawHud(state, extra) {
-    const p = state.player;
-    context.textBaseline = 'top';
-    // Backing panels: the sky behind the top corners is bright orange, so
-    // the cash/district/respect and the clock sit on dark glass, not on the sunset.
-    context.fillStyle = 'rgba(13, 15, 20, 0.6)';
-    context.fillRect(12, 8, 264, 88);
-    context.fillRect(VIEW.width - 356, 44, 344, 26);
-    text(`$${p.cash.toLocaleString('en-US')}`, 20, 16, 30, PALETTE.text, 'left');
-    text(districtFor(p.x, p.y), 20, 54, 15, PALETTE.muted, 'left');
-    const respect = RESPECT_RANKS[state.storyComplete ? 8 : state.missionIndex] || 'STREET';
-    text(`RESPECT · ${respect}`, 20, 74, 15, PALETTE.star, 'left');
-    // Wanted stars, top centre.
-    let stars = '';
-    for (let i = 0; i < 5; i += 1) stars += i < state.wanted ? '★' : '☆';
-    text(stars, VIEW.width / 2, 14, 32, PALETTE.star, 'center');
-    // Health bar, top right.
-    const bw = 180;
-    const bx = VIEW.width - bw - 20;
-    context.fillStyle = '#11141b';
-    context.fillRect(bx - 4, 14, bw + 8, 26);
-    context.fillStyle = p.health > 30 ? PALETTE.health : PALETTE.healthLow;
-    context.fillRect(bx, 18, bw * Math.max(0, p.health / 100), 18);
-    text('HP', bx - 10, 16, 22, PALETTE.text, 'right');
-    // Clock and weather, under the health bar.
-    text(`${clockString(state.time)} · GOLDEN HOUR · CLEAR 28°C`, VIEW.width - 20, 52, 15, PALETTE.muted, 'right');
-    // Mission line, bottom left.
-    if (state.missionText) {
-      context.fillStyle = 'rgba(13, 15, 20, 0.75)';
-      context.fillRect(16, VIEW.height - 56, 740, 44);
-      text(state.missionText, 28, VIEW.height - 46, 17, PALETTE.text, 'left');
-    }
-    // Speed and car damage, bottom centre-right, while driving.
-    if (!p.onFoot && p.inCar) {
-      const mph = Math.round(Math.abs(p.inCar.speed) * 0.14);
-      text(`${mph} mph`, VIEW.width / 2 + 80, VIEW.height - 124, 26, PALETTE.text, 'center');
-      const damage = p.inCar.damage || 0;
-      const dbx = VIEW.width / 2 - 20;
-      const dby = VIEW.height - 90;
-      text('DAMAGE', dbx - 8, dby - 2, 11, PALETTE.muted, 'right');
-      context.fillStyle = '#11141b';
-      context.fillRect(dbx, dby, 200, 8);
-      context.fillStyle = damage < 40 ? PALETTE.health : damage < 70 ? PALETTE.star : PALETTE.healthLow;
-      context.fillRect(dbx, dby, 200 * Math.max(0, Math.min(1, damage / 100)), 8);
-    }
-    // Off-screen mission arrow.
-    const t = state.missionTarget;
-    if (t) {
-      const sx = t.x - camera.x;
-      const sy = SKY_H + (t.y - camera.y) * SQ;
-      if (sx < 0 || sx > VIEW.width || sy < SKY_H || sy > VIEW.height) {
-        const cx = Math.max(60, Math.min(VIEW.width - 60, sx));
-        const cy = Math.max(SKY_H + 40, Math.min(VIEW.height - 60, sy));
-        const a = Math.atan2(sy - cy, sx - cx);
-        context.save();
-        context.translate(cx, cy);
-        context.rotate(a);
-        context.fillStyle = PALETTE.marker;
-        context.beginPath();
-        context.moveTo(18, 0);
-        context.lineTo(-10, -12);
-        context.lineTo(-10, 12);
-        context.closePath();
-        context.fill();
-        context.restore();
-      }
-    }
-    drawDispatch(state);
-    drawMissionTracker(state);
-    drawDialogue(state);
-    drawCrewCards(state);
-    drawRadio(extra);
-    drawWeaponStrip(state);
-    drawMinimap(state);
-  }
-
-  function drawMinimap(state) {
-    const mx = VIEW.width - MINI.width - MINI.margin;
-    const my = VIEW.height - MINI.height - MINI.margin;
-    const sx = MINI.width / WORLD.width;
-    const sy = MINI.height / WORLD.height;
-    context.fillStyle = 'rgba(13, 15, 20, 0.8)';
-    context.fillRect(mx - 4, my - 4, MINI.width + 8, MINI.height + 8);
-    context.fillStyle = PALETTE.grass;
-    context.fillRect(mx, my, MINI.width, MINI.height);
-    context.fillStyle = PALETTE.sea;
-    context.fillRect(mx, my + WORLD.seaY * sy, MINI.width, MINI.height - WORLD.seaY * sy);
-    context.fillStyle = PALETTE.road;
-    for (let x = 160; x < WORLD.width; x += WORLD.roadGap) context.fillRect(mx + x * sx - 1, my, 2, MINI.height);
-    for (let y = 160; y < WORLD.height; y += WORLD.roadGap) context.fillRect(mx, my + y * sy - 1, MINI.width, 2);
-    const t = state.missionTarget;
-    if (t) {
-      context.fillStyle = PALETTE.marker;
-      context.beginPath();
-      context.arc(mx + t.x * sx, my + t.y * sy, 5, 0, Math.PI * 2);
-      context.fill();
-    }
-    for (const cop of state.cops) {
-      if (!cop.active) continue;
-      context.fillStyle = '#4b7dff';
-      context.fillRect(mx + cop.x * sx - 2, my + cop.y * sy - 2, 4, 4);
-    }
-    if (state.wanted >= 3) {
-      const heli = heliGroundPos(state);
-      context.fillStyle = '#ffffff';
-      context.beginPath();
-      context.arc(mx + heli.x * sx, my + heli.y * sy, 4, 0, Math.PI * 2);
-      context.fill();
-    }
-    const p = state.player;
-    context.fillStyle = PALETTE.player;
-    context.beginPath();
-    context.arc(mx + p.x * sx, my + p.y * sy, 5, 0, Math.PI * 2);
-    context.fill();
-    context.strokeStyle = PALETTE.player;
-    context.beginPath();
-    context.moveTo(mx + p.x * sx, my + p.y * sy);
-    context.lineTo(mx + (p.x + Math.cos(p.angle) * 220) * sx, my + (p.y + Math.sin(p.angle) * 220) * sy);
-    context.stroke();
-  }
-
-  function drawPanel(title, lines, prompt, accentFirst, width) {
-    const w = width || PANEL.width;
-    const height = PANEL.top + lines.length * PANEL.line + PANEL.bottom;
-    const x = (VIEW.width - w) / 2;
-    const y = (VIEW.height - height) / 2;
-    context.fillStyle = PALETTE.panel;
-    context.fillRect(x, y, w, height);
-    context.textBaseline = 'alphabetic';
-    text(title, VIEW.width / 2, y + 78, 46, PALETTE.text, 'center');
-    for (let index = 0; index < lines.length; index += 1) {
-      const color = accentFirst && index === 0 ? PALETTE.star : PALETTE.muted;
-      text(lines[index], VIEW.width / 2, y + PANEL.top + index * PANEL.line, 20, color, 'center');
-    }
-    text(prompt, VIEW.width / 2, y + height - 38, 22, PALETTE.star, 'center');
-  }
-
-  // Paint one frame: sky, then the city through the chase camera, then the HUD or a panel.
-  function draw(state, screen, best, extra) {
-    context.setTransform(1, 0, 0, 1, 0, 0);
-    context.fillStyle = PALETTE.backdrop;
-    context.fillRect(0, 0, canvas.width, canvas.height);
-    const p = state.player;
-    const visibleHeight = (VIEW.height - SKY_H) / SQ;
-    camera.x = clamp(p.x - VIEW.width / 2, 0, WORLD.width - VIEW.width);
-    camera.y = clamp(p.y - visibleHeight * 0.55, 0, WORLD.height - visibleHeight);
-    // Sky, in screen space.
-    context.setTransform(view.scale, 0, 0, view.scale, view.x, view.y);
-    drawSky();
-    // The world, tilted: x straight, y squashed, the ground running up to
-    // the horizon line and no farther — the clip is what makes the horizon.
-    context.setTransform(view.scale, 0, 0, view.scale, view.x, view.y);
-    context.save();
-    context.beginPath();
-    context.rect(0, SKY_H, VIEW.width, VIEW.height - SKY_H);
-    context.clip();
-    context.setTransform(view.scale, 0, 0, view.scale * SQ, view.x - camera.x * view.scale, view.y + (SKY_H - camera.y * SQ) * view.scale);
-    drawCity(state);
-    drawMarker(state);
-    drawPickups(state);
-    drawEntities(state);
-    drawHeli(state);
-    context.restore();
-    // Golden-hour grade over the world, under the HUD.
-    context.setTransform(view.scale, 0, 0, view.scale, view.x, view.y);
-    const grade = context.createLinearGradient(0, SKY_H, 0, VIEW.height);
-    grade.addColorStop(0, 'rgba(255, 120, 40, 0.05)');
-    grade.addColorStop(1, 'rgba(255, 90, 20, 0.11)');
-    context.fillStyle = grade;
-    context.fillRect(0, SKY_H, VIEW.width, VIEW.height - SKY_H);
-    if (screen === SCREEN_TITLE) {
-      const save = extra && extra.save;
-      const progress = save && (save.cash > 0 || save.missionIndex > 0 || (save.crew && save.crew.length > 0))
-        ? (save.storyComplete
-          ? 'STORY COMPLETE — Solmar is yours. Free roam, or start over.'
-          : `CONTINUE — JOB ${(save.missionIndex || 0) + 1}/8 · $${(save.cash || 0).toLocaleString('en-US')} · CREW ${(save.crew || []).length}/3`)
-        : `Best cash: $${(best || 0).toLocaleString('en-US')}`;
-      drawPanel('SOLMAR HEAT', [
-        '8 STORY JOBS · CREW OF 3 · SAVES · RADIO · 5-STAR PD CHASE',
-        'Steal cars, run Milo\u2019s eight jobs, build your crew,',
-        'outrun the Solmar PD from zero to five stars —',
-        'and take the payday. Golden hour over Solmar Bay.',
-        progress,
-        'Move: WASD or arrows · Run: Shift · Steal / get out: E',
-        'Punch: Space or F · Radio: R · Pause: P · Mute: M',
-      ], 'Press Enter or click to start', true);
-      return;
-    }
-    drawHud(state, extra);
-    if (screen === SCREEN_PAUSED) {
-      drawPanel('Paused', ['The city waits for no one — except now.'], 'Press P to keep driving', false, 600);
-    } else if (screen === SCREEN_BUSTED) {
-      drawPanel('BUSTED', [`The Solmar PD caught you. Cash kept: $${p.cash.toLocaleString('en-US')}.`, `Best cash: $${(best || 0).toLocaleString('en-US')}.`], 'Press Enter to try again', false, 600);
-    } else if (screen === SCREEN_WASTED) {
-      drawPanel('WASTED', [`Solmar got the better of you. Cash kept: $${p.cash.toLocaleString('en-US')}.`, `Best cash: $${(best || 0).toLocaleString('en-US')}.`], 'Press Enter to try again', false, 600);
-    } else if (screen === SCREEN_COMPLETE) {
-      drawPanel('STORY COMPLETE', [`Every job done. Payday: $${p.cash.toLocaleString('en-US')}.`, 'Solmar is yours — keep driving, the city is still open.'], 'Press Enter to keep playing', false, 600);
-    }
-  }
-
-  resize();
-  window.addEventListener('resize', resize);
-  return { draw };
 }
