@@ -1,5 +1,9 @@
 # SOLMAR HEAT — 10 STORY JOBS · CREW OF 3 · SAVES · RADIO · RACES · GARAGE · 5-STAR PD CHASE
 
+[![make.fun · gta6-01](https://make.fun/badge/gta6-01.svg)](https://make.fun/bounty/gta6-01?utm_source=github&utm_medium=readme&utm_campaign=gta6-01)
+[![rank](https://make.fun/badge/gta6-01/zavonlame/gta6-01/rank.svg)](https://make.fun/bounty/gta6-01/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=gta6-01)
+[![reward](https://make.fun/badge/gta6-01/zavonlame/gta6-01/reward.svg)](https://make.fun/bounty/gta6-01?utm_source=github&utm_medium=readme&utm_campaign=gta6-01)
+
 A sun-soaked open-world crime game in the fictional coastal city of Solmar.
 Ten story jobs for fixer Cassia Voss, a crew of three, a five-star Solmar PD
 that answers with named dispatch units, roadblocks and the CONDOR-1 air unit,
